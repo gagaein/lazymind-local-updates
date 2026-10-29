@@ -1,0 +1,445 @@
+package attempt
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"lazymind/core/common/orm"
+	"lazymind/core/common/taskdisplay"
+	"lazymind/core/tasktiming"
+	"lazymind/core/workflow/controlstore"
+
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+)
+
+const (
+	CodeLeaseLost         = "ATTEMPT_LEASE_LOST"
+	CodeAlreadyTerminal   = "ATTEMPT_ALREADY_TERMINAL"
+	CodeNotFound          = "ATTEMPT_NOT_FOUND"
+	CodeNotClaimable      = "ATTEMPT_NOT_CLAIMABLE"
+	CodeSchemaUnavailable = "WORKFLOW_ATTEMPT_SCHEMA_UNAVAILABLE"
+)
+
+var (
+	ErrLeaseLost         = protocolError(CodeLeaseLost)
+	ErrAlreadyTerminal   = protocolError(CodeAlreadyTerminal)
+	ErrNotFound          = protocolError(CodeNotFound)
+	ErrNotClaimable      = protocolError(CodeNotClaimable)
+	ErrSchemaUnavailable = protocolError(CodeSchemaUnavailable)
+)
+
+type protocolError string
+
+func (e protocolError) Error() string { return string(e) }
+
+type Config struct {
+	LeaseDuration time.Duration
+}
+
+func (c Config) leaseDuration() time.Duration {
+	if c.LeaseDuration <= 0 {
+		return 30 * time.Second
+	}
+	return c.LeaseDuration
+}
+
+type Service struct {
+	controlFinalization bool
+	db                  *gorm.DB
+	config              Config
+	now                 func() time.Time
+}
+
+// ServiceCapable identifies the protocol implementation compiled into this
+// binary. Deployment capability additionally requires SchemaCapable.
+func ServiceCapable() bool { return ContractVersion == "workflow.v1" }
+
+func New(db *gorm.DB, config Config) *Service {
+	return &Service{db: db, config: config, now: func() time.Time { return time.Now().UTC() }}
+}
+
+// WithDB shares the caller's transaction while preserving lease policy and clock.
+func (s *Service) WithDB(db *gorm.DB) *Service {
+	copy := *s
+	copy.db = db
+	return &copy
+}
+
+// WithControlTransaction is used only by the workflow-owned atomic finalization use case.
+func (s *Service) WithControlTransaction(db *gorm.DB) *Service {
+	copy := s.WithDB(db)
+	copy.controlFinalization = true
+	return copy
+}
+
+func SchemaCapable(db *gorm.DB) bool {
+	if db == nil || !db.Migrator().HasTable(&orm.WorkflowOutbox{}) {
+		return false
+	}
+	for _, column := range []string{"lease_owner", "lease_token", "fencing_generation", "lease_expires_at", "heartbeat_at", "progress_json", "terminal_code", "result_json"} {
+		if !db.Migrator().HasColumn(&orm.WorkflowSessionStep{}, column) {
+			return false
+		}
+	}
+	return true
+}
+
+type QueueRequest struct {
+	AttemptID   string
+	SessionID   string
+	StepID      string
+	AttemptNo   int
+	Payload     json.RawMessage
+	OwnerUserID string
+}
+
+func appendEvent(tx *gorm.DB, row orm.WorkflowSessionStep, owner, eventType string, payload json.RawMessage, now time.Time) error {
+	var session orm.WorkflowSession
+	// Standalone/legacy attempt stores may not have a Session projection yet.
+	_ = tx.Select("create_user_id", "state_version").Where("id = ?", row.SessionID).First(&session).Error
+	if owner == "" {
+		owner = session.CreateUserID
+	}
+	return tasktiming.PersistWorkflowEvent(tx, &orm.WorkflowEvent{SessionID: row.SessionID, OwnerUserID: owner,
+		ContractVersion: ContractVersion, EventType: eventType, EntityID: row.ID,
+		StateVersion: session.StateVersion, PayloadJSON: payload, CreatedAt: now})
+}
+
+// Queue persists the authoritative queued Attempt and generic Outbox in one
+// transaction. The legacy LazyMind worker outbox is intentionally untouched.
+func (s *Service) Queue(ctx context.Context, request QueueRequest) (orm.WorkflowSessionStep, error) {
+	if !SchemaCapable(s.db) {
+		return orm.WorkflowSessionStep{}, ErrSchemaUnavailable
+	}
+	if request.AttemptID == "" {
+		request.AttemptID = uuid.NewString()
+	}
+	if request.AttemptNo < 1 {
+		request.AttemptNo = 1
+	}
+	now := s.now()
+	row := orm.WorkflowSessionStep{ID: request.AttemptID, SessionID: request.SessionID,
+		StepID: request.StepID, Attempt: request.AttemptNo, TaskID: request.AttemptID,
+		Status: "queued", Validity: "effective", ProgressJSON: `{}`,
+		ResultJSON: `{}`, CreatedAt: now, UpdatedAt: now}
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&row).Error; err != nil {
+			return err
+		}
+		outbox := orm.WorkflowOutbox{ID: uuid.NewString(), AttemptID: row.ID,
+			SessionID: row.SessionID, PayloadJSON: request.Payload, Status: "pending",
+			CreatedAt: now, UpdatedAt: now}
+		if err := tx.Create(&outbox).Error; err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(map[string]any{"attempt_id": row.ID, "step_id": row.StepID, "status": "queued"})
+		return appendEvent(tx, row, request.OwnerUserID, "attempt.patch", payload, now)
+	})
+	return row, err
+}
+
+type Claim struct {
+	AttemptID         string    `json:"attempt_id"`
+	LeaseToken        string    `json:"lease_token"`
+	LeaseExpiresAt    time.Time `json:"lease_expires_at"`
+	FencingGeneration int64     `json:"fencing_generation"`
+}
+
+func newToken() (string, error) {
+	value := make([]byte, 32)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value), nil
+}
+
+// Claim uses a compare-and-swap update. Expired claimed/running Attempts may
+// be reclaimed and always receive a new token and higher fencing generation.
+func (s *Service) Claim(ctx context.Context, executorID string) (Claim, error) {
+	return s.ClaimForHost(ctx, executorID, "")
+}
+
+// Only controlled sessions opt into per-attempt routing. Native sessions retain main routing.
+const executorHostSQL = `CASE WHEN ps.controller_host = 'external-agent' AND ps.control_protocol = 'workflow.control.v1' THEN COALESCE(NULLIF(plugin_session_steps.executor_host, ''), ps.controller_host) ELSE COALESCE(ps.controller_host, 'lazymind') END` // workflow-naming: persistence
+
+// ClaimForHost routes by the attempt executor, falling back to the session
+// for attempts created before per-step routing. An empty Host is retained only for compatibility and tests.
+func (s *Service) ClaimForHost(ctx context.Context, executorID, host string) (Claim, error) {
+	if !SchemaCapable(s.db) {
+		return Claim{}, ErrSchemaUnavailable
+	}
+	now := s.now()
+	var candidate orm.WorkflowSessionStep
+	query := s.db.WithContext(ctx).Model(&orm.WorkflowSessionStep{}).Where(
+		"plugin_session_steps.validity = 'effective' AND (plugin_session_steps.status = 'queued' OR "+ // workflow-naming: persistence
+			"(plugin_session_steps.status IN ('claimed','running') AND plugin_session_steps.lease_expires_at < ?))", now, // workflow-naming: persistence
+	)
+	if host != "" {
+		query = query.Joins("JOIN plugin_sessions ps ON ps.id = plugin_session_steps.session_id").
+			Where(executorHostSQL+" = ?", host) // workflow-naming: persistence
+	}
+	err := query.Order("plugin_session_steps.created_at ASC").First(&candidate).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Claim{}, ErrNotClaimable
+	}
+	if err != nil {
+		return Claim{}, err
+	}
+	return s.claimCandidate(ctx, candidate, executorID, false)
+}
+
+// ClaimAttemptForHost claims one exact Attempt for an interactive Host. A
+// repeat from the same executor rotates the lease, which lets a restarted MCP
+// connection resume without exposing the internal lease token to the model.
+func (s *Service) ClaimAttemptForHost(ctx context.Context, attemptID, executorID, host string) (Claim, error) {
+	if !SchemaCapable(s.db) {
+		return Claim{}, ErrSchemaUnavailable
+	}
+	var candidate orm.WorkflowSessionStep
+	query := s.db.WithContext(ctx).Model(&orm.WorkflowSessionStep{}).
+		Select("plugin_session_steps.*").                                                               // workflow-naming: persistence
+		Where("plugin_session_steps.id = ? AND plugin_session_steps.validity = 'effective'", attemptID) // workflow-naming: persistence
+	if host != "" {
+		query = query.Joins("JOIN plugin_sessions ps ON ps.id = plugin_session_steps.session_id").
+			Where(executorHostSQL+" = ?", host) // workflow-naming: persistence
+	}
+	if err := query.First(&candidate).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return Claim{}, ErrNotClaimable
+		}
+		return Claim{}, err
+	}
+	return s.claimCandidate(ctx, candidate, executorID, true)
+}
+
+// ClaimQueuedAttemptForHost does not rotate a running worker's handle. Only explicit Resume may do that.
+func (s *Service) ClaimQueuedAttemptForHost(ctx context.Context, attemptID, executorID, host string) (Claim, error) {
+	var candidate orm.WorkflowSessionStep
+	err := s.db.WithContext(ctx).Model(&orm.WorkflowSessionStep{}).
+		Joins("JOIN plugin_sessions ps ON ps.id = plugin_session_steps.session_id").                                                                                                  // workflow-naming: persistence
+		Where("plugin_session_steps.id = ? AND plugin_session_steps.status = 'queued' AND plugin_session_steps.validity = 'effective' AND "+executorHostSQL+" = ?", attemptID, host). // workflow-naming: persistence
+		Select("plugin_session_steps.*").First(&candidate).Error                                                                                                                      // workflow-naming: persistence
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Claim{}, ErrNotClaimable
+	}
+	if err != nil {
+		return Claim{}, err
+	}
+	return s.claimCandidate(ctx, candidate, executorID, false)
+}
+
+func (s *Service) claimCandidate(ctx context.Context, candidate orm.WorkflowSessionStep, executorID string, allowCurrentOwner bool) (Claim, error) {
+	now := s.now()
+	token, err := newToken()
+	if err != nil {
+		return Claim{}, err
+	}
+	expires := now.Add(s.config.leaseDuration())
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		session, err := controlstore.LockControlledSession(tx, candidate.SessionID)
+		if err != nil {
+			return err
+		}
+		controlled := controlstore.Controlled(session)
+		if controlled {
+			if err := controlstore.GuardClaim(tx, session); err != nil {
+				return err
+			}
+		}
+
+		condition := "id = ? AND fencing_generation = ? AND (status = 'queued' OR lease_expires_at < ?"
+		if controlled {
+			condition = "id = ? AND fencing_generation = ? AND (status = 'queued' OR (status IN ('claimed','running') AND lease_expires_at < ?)"
+		}
+		args := []any{candidate.ID, candidate.FencingGeneration, now}
+		if allowCurrentOwner {
+			condition += " OR (lease_owner = ? AND status IN ('claimed','running'))"
+			args = append(args, executorID)
+		}
+		condition += ")"
+		result := tx.Model(&orm.WorkflowSessionStep{}).Where(condition, args...).
+			Updates(map[string]any{"status": "claimed", "lease_owner": executorID,
+				"lease_token": token, "fencing_generation": gorm.Expr("fencing_generation + 1"),
+				"lease_expires_at": expires, "heartbeat_at": now, "updated_at": now})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrNotClaimable
+		}
+		if err := tx.Model(&orm.WorkflowOutbox{}).Where("attempt_id = ? AND status IN ('pending','claimed')", candidate.ID).
+			Updates(map[string]any{"status": "claimed", "updated_at": now}).Error; err != nil {
+			return err
+		}
+		// A worker claim is not receipt by the external controller. Keep its
+		// notification pending until the controller observes it through MCP.
+		payload, _ := json.Marshal(map[string]any{"attempt_id": candidate.ID, "status": "claimed", "fencing_generation": candidate.FencingGeneration + 1})
+		return appendEvent(tx, candidate, "", "attempt.patch", payload, now)
+	})
+	if err != nil {
+		return Claim{}, err
+	}
+	return Claim{AttemptID: candidate.ID, LeaseToken: token, LeaseExpiresAt: expires,
+		FencingGeneration: candidate.FencingGeneration + 1}, nil
+}
+
+func (s *Service) validLeaseQuery(attemptID, token string, now time.Time) *gorm.DB {
+	return s.db.Model(&orm.WorkflowSessionStep{}).Where(
+		"id = ? AND lease_token = ? AND lease_expires_at >= ? AND status IN ('claimed','running')",
+		attemptID, token, now,
+	)
+}
+
+// ValidateLease verifies that a remote Executor still owns a live Attempt lease.
+// Remote context, input and Artifact endpoints use this same check so a stale
+// worker cannot observe or mutate execution state after fencing advances.
+func (s *Service) ValidateLease(ctx context.Context, attemptID, token string) error {
+	var count int64
+	err := s.validLeaseQuery(attemptID, token, s.now()).WithContext(ctx).Count(&count).Error
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+func (s *Service) Heartbeat(ctx context.Context, attemptID, token string) (time.Time, error) {
+	now := s.now()
+	expires := now.Add(s.config.leaseDuration())
+	result := s.validLeaseQuery(attemptID, token, now).WithContext(ctx).
+		Updates(map[string]any{"lease_expires_at": expires, "heartbeat_at": now, "updated_at": now})
+	if result.Error != nil {
+		return time.Time{}, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return time.Time{}, ErrLeaseLost
+	}
+	return expires, nil
+}
+
+func (s *Service) Progress(ctx context.Context, attemptID, token string, progress json.RawMessage) (err error) {
+	defer func() {
+		if err != nil {
+			taskdisplay.Observe(ctx, taskdisplay.EventRejected, 0, 1)
+		}
+	}()
+	display, err := decodePublicDisplay(progress)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&orm.WorkflowSessionStep{}).Where(
+			"id = ? AND lease_token = ? AND lease_expires_at >= ? AND status IN ('claimed','running')",
+			attemptID, token, now).UpdateColumn("updated_at", gorm.Expr("updated_at"))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrLeaseLost
+		}
+		var row orm.WorkflowSessionStep
+		if err := tx.Where("id = ?", attemptID).First(&row).Error; err != nil {
+			return err
+		}
+		duplicate, err := persistPublicDisplay(tx, row, display, now)
+		if duplicate {
+			taskdisplay.Observe(ctx, taskdisplay.EventDuplicate, 0, 1)
+		}
+		if err != nil || duplicate {
+			return err
+		}
+		if err := tx.Model(&row).Updates(map[string]any{"status": "running", "progress_json": progress, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		return appendEvent(tx, row, "", "attempt.progress", progress, now)
+	})
+}
+
+func terminal(status string) bool {
+	return status == "succeeded" || status == "failed" || status == "cancelled" || status == "interrupted"
+}
+
+// Terminal implements first-valid-write-wins. Repeating the winning status is
+// idempotent; a competing terminal status returns ATTEMPT_ALREADY_TERMINAL.
+func (s *Service) Terminal(ctx context.Context, attemptID, token, status, code string, resultJSON json.RawMessage) error {
+	if !terminal(status) {
+		return ErrAlreadyTerminal
+	}
+	now := s.now()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current orm.WorkflowSessionStep
+		if err := tx.Where("id = ?", attemptID).First(&current).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		session, err := controlstore.LockControlledSession(tx, current.SessionID)
+		if err != nil {
+			return err
+		}
+		if controlstore.Controlled(session) && !s.controlFinalization {
+			return controlstore.Reject("CONTROL_FINALIZATION_REQUIRED", "use workflow.step.complete to settle this controlled execution")
+		}
+		if terminal(current.Status) {
+			if current.Status == status {
+				return nil
+			}
+			return ErrAlreadyTerminal
+		}
+		if current.LeaseToken != token || current.LeaseExpiresAt == nil || current.LeaseExpiresAt.Before(now) {
+			return ErrLeaseLost
+		}
+		updated := tx.Model(&orm.WorkflowSessionStep{}).
+			Where("id = ? AND lease_token = ? AND status IN ('claimed','running')", attemptID, token).
+			Updates(map[string]any{"status": status, "terminal_code": code, "result_json": resultJSON,
+				"lease_expires_at": nil, "updated_at": now})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return ErrAlreadyTerminal
+		}
+		if err := finishTransactionalOutputs(ctx, tx, current, status); err != nil {
+			return err
+		}
+		outboxStatus := "completed"
+		if status == "cancelled" {
+			outboxStatus = "cancelled"
+		} else if status == "failed" || status == "interrupted" {
+			outboxStatus = "failed"
+		}
+		if err := tx.Model(&orm.WorkflowOutbox{}).Where("attempt_id = ?", attemptID).
+			Updates(map[string]any{"status": outboxStatus, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(map[string]any{"attempt_id": attemptID, "status": status, "error_code": code})
+		return appendEvent(tx, current, "", "attempt.patch", payload, now)
+	})
+}
+
+func (s *Service) Complete(ctx context.Context, attemptID, token string, result json.RawMessage) error {
+	return s.Terminal(ctx, attemptID, token, "succeeded", "", result)
+}
+
+func (s *Service) Fail(ctx context.Context, attemptID, token, code string, result json.RawMessage) error {
+	return s.Terminal(ctx, attemptID, token, "failed", code, result)
+}
+
+func (s *Service) Cancel(ctx context.Context, attemptID, token string) error {
+	return s.Terminal(ctx, attemptID, token, "cancelled", "CANCELLED", json.RawMessage(`{}`))
+}
+
+func (s *Service) Attempt(ctx context.Context, id string) (orm.WorkflowSessionStep, error) {
+	var row orm.WorkflowSessionStep
+	err := s.db.WithContext(ctx).Where("id = ?", id).First(&row).Error
+	return row, err
+}
