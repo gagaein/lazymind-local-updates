@@ -11,15 +11,18 @@ import (
 
 func TestDurableDisplayStates(t *testing.T) {
 	for _, sample := range []struct {
-		name, session, step, mode, want      string
-		stopped, skip, stale, runningSibling bool
+		name, session, step, mode, terminalCode, want string
+		stopped, skip, stale, runningSibling          bool
 	}{
 		{name: "preparing", session: "waiting", want: "running"},
 		{name: "running", session: "active", step: "running", want: "running"},
 		{name: "approval", session: "waiting", step: "succeeded", mode: "human", want: "waiting"},
 		{name: "skip approval", session: "waiting", step: "succeeded", mode: "human", skip: true, want: "failed"},
 		{name: "automatic no advance", session: "waiting", step: "succeeded", mode: "auto", want: "failed"},
-		{name: "interrupted", session: "waiting", step: "interrupted", mode: "human", want: "failed"},
+		{name: "generic interruption without stop mismatch", session: "waiting", step: "interrupted", mode: "human", want: "failed"},
+		{name: "active interrupted retry is preparing", session: "active", step: "interrupted", mode: "human", want: "running"},
+		{name: "active executor stop without session stop is interrupted", session: "active", step: "interrupted", mode: "human", terminalCode: "WORKFLOW_STOPPED", want: "interrupted"},
+		{name: "recovered executor stop without session stop is interrupted", session: "waiting", step: "interrupted", mode: "human", terminalCode: "WORKFLOW_STOPPED", want: "interrupted"},
 		{name: "failed", session: "failed", step: "failed", mode: "human", want: "failed"},
 		{name: "driver failure cannot discard pending review", session: "failed", step: "succeeded", mode: "human", want: "waiting"},
 		{name: "user pause", session: "waiting", step: "interrupted", stopped: true, want: "paused"},
@@ -40,7 +43,7 @@ func TestDurableDisplayStates(t *testing.T) {
 				t.Fatal(err)
 			}
 			if sample.step != "" {
-				step := orm.WorkflowSessionStep{ID: "attempt", SessionID: session.ID, StepID: "step", TaskID: "task", Status: sample.step, Attempt: 1, Validity: "effective", CreatedAt: now.Add(-time.Second)}
+				step := orm.WorkflowSessionStep{ID: "attempt", SessionID: session.ID, StepID: "step", TaskID: "task", Status: sample.step, TerminalCode: sample.terminalCode, Attempt: 1, Validity: "effective", CreatedAt: now.Add(-time.Second)}
 				if sample.stale {
 					step.Validity = "stale"
 				}

@@ -73,6 +73,7 @@ func readState(db *gorm.DB, session orm.WorkflowSession) (View, error) {
 		return current[i].CreatedAt.After(current[j].CreatedAt)
 	})
 	running := false
+	unconfirmedStop := false
 	stoppedAt := time.Time{}
 	if session.LastStoppedAt != nil {
 		stoppedAt = *session.LastStoppedAt
@@ -81,9 +82,8 @@ func readState(db *gorm.DB, session orm.WorkflowSession) (View, error) {
 		switch step.Status {
 		case "pending", "queued", "claimed", "running":
 			running = true
-		}
-		if step.TerminalCode == "WORKFLOW_STOPPED" && step.UpdatedAt.After(stoppedAt) {
-			stoppedAt = step.UpdatedAt
+		case "interrupted", "cancelled", "canceled":
+			unconfirmedStop = unconfirmedStop || step.TerminalCode == "WORKFLOW_STOPPED"
 		}
 	}
 	if session.Status == "pausing" {
@@ -104,13 +104,18 @@ func readState(db *gorm.DB, session orm.WorkflowSession) (View, error) {
 	if session.Status == "completed" {
 		return View{Status: "completed", Reason: "completed"}, nil
 	}
-	// Only an admitted driver or explicit user resume can enter active. Historical
-	// stop markers must not hide that preparation before its new attempt exists.
-	if session.Status == "active" {
-		return View{Status: "running", Reason: "preparing"}, nil
-	}
 	if session.Status == "failed" {
 		return View{Status: "failed", Reason: "execution_failed"}, nil
+	}
+	// WORKFLOW_STOPPED describes the executor outcome, not who requested it.
+	// Only LastStoppedAt or an explicit stopped session proves a user pause.
+	if unconfirmedStop && session.LastStoppedAt == nil && session.Status != "stopped" {
+		return View{Status: "interrupted", Reason: "execution_interrupted"}, nil
+	}
+	// An admitted resume temporarily has no new attempt, so active normally means
+	// preparing before the new attempt is persisted.
+	if session.Status == "active" {
+		return View{Status: "running", Reason: "preparing"}, nil
 	}
 	paused := session.Status == "stopped" || !stoppedAt.IsZero()
 	for _, step := range current {

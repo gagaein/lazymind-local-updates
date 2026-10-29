@@ -41,6 +41,9 @@ class RemoteWorkflowExecutor:
         self.token = os.getenv('LAZYMIND_WORKFLOW_EXECUTOR_TOKEN', '').strip()
         self.poll_seconds = float(os.getenv('LAZYMIND_WORKFLOW_EXECUTOR_POLL_SECONDS', '0.5'))
         self.heartbeat_seconds = float(os.getenv('LAZYMIND_WORKFLOW_EXECUTOR_HEARTBEAT_SECONDS', '10'))
+        self.heartbeat_failure_limit = max(
+            1, int(os.getenv('LAZYMIND_WORKFLOW_EXECUTOR_HEARTBEAT_FAILURE_LIMIT', '3')),
+        )
         self.concurrency = max(1, int(os.getenv('LAZYMIND_WORKFLOW_EXECUTOR_CONCURRENCY', '4')))
         self.runtime = RemoteExecutorClient(self.base_url, self.executor_id, 'lazymind', self.token)
 
@@ -92,6 +95,10 @@ class RemoteWorkflowExecutor:
         attempt_id = str(claim['attempt_id'])
         lease = str(claim['lease_token'])
         task_id = ''
+        execution_identity = {
+            'attempt_id': attempt_id,
+            'generation': str(claim.get('fencing_generation') or ''),
+        }
         try:
             context = await self.runtime.context(client, attempt_id, lease)
             metadata = context.get('metadata') or {}
@@ -126,13 +133,26 @@ class RemoteWorkflowExecutor:
             lease_lost = threading.Event()
 
             def heartbeat() -> None:
+                failures = 0
                 with httpx.Client(timeout=5.0) as heartbeat_client:
                     while not stopped.wait(self.heartbeat_seconds):
                         try:
                             self.runtime.heartbeat_sync(heartbeat_client, attempt_id, lease)
-                        except Exception:
+                            failures = 0
+                        except Exception as exc:
+                            failures += 1
+                            if not self._heartbeat_failure_is_terminal(
+                                exc, failures, self.heartbeat_failure_limit,
+                            ):
+                                LOG.warning(
+                                    'Workflow heartbeat failed (%s/%s) for %s; retrying',
+                                    failures, self.heartbeat_failure_limit, attempt_id,
+                                )
+                                continue
                             lease_lost.set()
-                            self._cancel_subagent(task_id)
+                            self._cancel_subagent(
+                                task_id, execution_identity, reason='lease_lost',
+                            )
                             return
 
             heartbeat_thread = threading.Thread(
@@ -237,7 +257,9 @@ class RemoteWorkflowExecutor:
                         },
                     )
                     frames = bounded_frames(
-                        stream, params, lambda: self._cancel_subagent(task_id),
+                        stream, params, lambda: self._cancel_subagent(
+                            task_id, execution_identity, reason='execution_timeout',
+                        ),
                     ) if policy_for(params) else stream
                     async with aclosing(frames):
                         async for frame in frames:
@@ -691,11 +713,18 @@ class RemoteWorkflowExecutor:
         return value if isinstance(value, dict) else None
 
     @staticmethod
-    def _cancel_subagent(task_id: str) -> None:
-        """Use the ordinary LazyMind cancellation channel; no Workflow-only loop."""
+    def _heartbeat_failure_is_terminal(
+        exc: Exception, failures: int, failure_limit: int,
+    ) -> bool:
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else 0
+        return status in {401, 409} or failures >= failure_limit
+
+    @staticmethod
+    def _cancel_subagent(task_id: str, execution=None, *, reason: str = 'user') -> None:
+        """Cancel one fenced execution without signalling a replacement generation."""
         try:
             from lazymind.chat.engine.agent_runtime.cancellation import request_cancel
-            request_cancel(task_id)
+            request_cancel(task_id, execution=execution, reason=reason)
         except Exception:
             LOG.exception('failed to cancel LazyMind SubAgent task %s', task_id)
 

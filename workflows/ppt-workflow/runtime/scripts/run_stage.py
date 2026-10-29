@@ -466,7 +466,7 @@ def _build_brief_page_query(
                 "size": inherited_image_size,
                 "alt": (inherited_image or {}).get('alt') or None,
             }, ensure_ascii=False, indent=2),
-            "Insert exactly one foreground <img> whose src is the exact path above. "
+            "Render this bound image once as a foreground <img> whose src is the exact path above. "
             "Do not leave an empty image container and do not use the image as a CSS background.",
         ])
     background_path = (background_image or {}).get('local_path')
@@ -1234,12 +1234,7 @@ def _ensure_outline_reference_images(
     pages: list[dict],
     available_reference_images: list[dict],
 ) -> int:
-    """Repair missing/invalid Pool-B image bindings in an LLM outline.
-
-    Valid document-embedded (Pool-A) bindings are left untouched.  Valid
-    Pool-B bindings are de-duplicated, then empty pages first receive images
-    named in their own prose and finally the remaining images in source order.
-    """
+    """Normalize image bindings and fail if a required source image was lost."""
     available_indices = [
         entry.get("reference_image_index")
         for entry in available_reference_images
@@ -1252,48 +1247,60 @@ def _ensure_outline_reference_images(
     repaired = 0
 
     for page in pages:
-        original = page.get("use_image")
-        if original is None:
-            continue
-        candidates = original if isinstance(original, list) else [original]
-        selected: dict | None = None
+        original = page.get('use_image')
+        if original in (None, []):
+            mentioned = _outline_reference_image_mentions(page, available_reference_images)
+            candidates = [{'reference_image_index': index} for index in mentioned]
+        elif isinstance(original, dict):
+            candidates = [original]
+        elif isinstance(original, list):
+            candidates = original
+        else:
+            raise ValueError(f"page {page.get('page_no')}: use_image must be an array")
+
+        normalized: list[dict[str, int]] = []
         for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
-            if "reference_image_index" in candidate:
-                index = candidate.get("reference_image_index")
-                if (
-                    isinstance(index, int)
-                    and not isinstance(index, bool)
-                    and index in available_set
-                    and index not in used
-                ):
-                    selected = {"reference_image_index": index}
-                    used.add(index)
-                    break
+            keys = set(candidate)
+            if keys == {'reference_image_index'}:
+                index = candidate.get('reference_image_index')
+                if type(index) is not int or index not in available_set:
+                    continue
+                normalized.append({'reference_image_index': index})
+                used.add(index)
                 continue
-            if "doc_index" in candidate and "image_index" in candidate:
-                selected = candidate
-                break
-        if selected is None:
-            page["use_image"] = None
+            if keys == {'doc_index', 'image_index'}:
+                doc_index = candidate.get('doc_index')
+                image_index = candidate.get('image_index')
+                if (
+                    type(doc_index) is not int or doc_index < 0
+                    or type(image_index) is not int or image_index < 0
+                ):
+                    continue
+                normalized.append({'doc_index': doc_index, 'image_index': image_index})
+                continue
+        if normalized != original:
             repaired += 1
-        elif isinstance(original, list) or selected != original:
-            page["use_image"] = selected
-            repaired += 1
+        page['use_image'] = normalized
 
-    for page in pages:
-        if page.get("use_image") is not None:
-            continue
-        mentioned = _outline_reference_image_mentions(page, available_reference_images)
-        index = next((item for item in mentioned if item not in used), None)
-        if index is None:
-            index = next((item for item in available_indices if item not in used), None)
-        if index is None:
-            break
-        page["use_image"] = {"reference_image_index": index}
-        used.add(index)
-        repaired += 1
+    required = {
+        entry['reference_image_index']
+        for entry in available_reference_images
+        if entry.get('required') is True
+    }
+    missing = sorted(required - used)
+    if missing:
+        labels = []
+        by_index = {
+            entry['reference_image_index']: entry
+            for entry in available_reference_images
+            if isinstance(entry.get('reference_image_index'), int)
+        }
+        for index in missing:
+            entry = by_index.get(index) or {}
+            labels.append(str(entry.get('asset_id') or entry.get('basename') or index))
+        raise ValueError('required source images were not bound: ' + ', '.join(labels))
 
     return repaired
 
@@ -1329,6 +1336,7 @@ def cmd_outline(
     ua = ip.get("user_assets") or {}
     ref_images_in = ua.get("reference_images") or []
     ref_captions = ua.get("reference_image_captions") or {}
+    ref_metadata = ua.get("reference_image_metadata") or {}
     available_reference_images: list[dict] = []
     for i, entry in enumerate(ref_images_in):
         if isinstance(entry, dict):
@@ -1343,10 +1351,16 @@ def cmd_outline(
             continue
         if not caption:
             caption = (ref_captions.get(p) or "").strip()
+        metadata = ref_metadata.get(p) if isinstance(ref_metadata, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
         available_reference_images.append({
             "reference_image_index": i,
             "basename": Path(p).name,
             "caption": caption or None,
+            "asset_id": metadata.get("asset_id") or None,
+            "source_block_id": metadata.get("source_block_id") or None,
+            "required": metadata.get("required") is True,
+            "reuse_allowed": metadata.get("reuse_allowed") is True,
         })
 
     approved_path = deck / "approved_outline.md"
@@ -1448,10 +1462,13 @@ def cmd_outline(
                     'Do not restart the workflow or generate a new deck.'
                 ),
             }, ensure_ascii=False)
-    image_bindings_repaired = _ensure_outline_reference_images(
-        pages,
-        available_reference_images,
-    )
+    try:
+        image_bindings_repaired = _ensure_outline_reference_images(
+            pages,
+            available_reference_images,
+        )
+    except ValueError as exc:
+        return _fail(f'outline: {exc}')
     _write_text(deck / "outline.json", json.dumps(data, ensure_ascii=False, indent=2))
     return _ok(
         path="outline.json",
@@ -1703,7 +1720,15 @@ def _resolve_inherited_table(ip: dict, page_outline: dict) -> dict | None:
         return None
 
 
-def _resolve_inherited_image(ip: dict, page_outline: dict, deck: Path, page_no: int) -> dict | None:
+def _resolve_inherited_image(
+    ip: dict,
+    page_outline: dict,
+    deck: Path,
+    page_no: int,
+    *,
+    position: int = 1,
+    total: int = 1,
+) -> dict | None:
     """Resolve `page_outline.use_image` into a concrete image.
 
     Two variants are supported:
@@ -1792,11 +1817,38 @@ def _resolve_inherited_image(ip: dict, page_outline: dict, deck: Path, page_no: 
 
     # Copy into <deck_dir>/images/page_XXX_inherited.<ext> (preserve ext)
     ext = src_path.suffix.lower() or ".png"
-    dst_rel = f"images/page_{page_no:03d}_inherited{ext}"
+    suffix = f'_{position:02d}' if total > 1 else ''
+    dst_rel = f"images/page_{page_no:03d}_inherited{suffix}{ext}"
     dst_abs = deck / dst_rel
     dst_abs.parent.mkdir(parents=True, exist_ok=True)
     dst_abs.write_bytes(src_path.read_bytes())
-    return {"remote_url": None, "local_path": dst_rel, "alt": alt}
+    return {"remote_url": None, "local_path": dst_rel, "alt": alt, "binding": ref}
+
+
+def _resolve_page_images(ip: dict, page_outline: dict, deck: Path, page_no: int) -> list[dict]:
+    """Resolve canonical ordered image bindings; accept the legacy single object."""
+    value = page_outline.get('use_image')
+    if value in (None, []):
+        return []
+    bindings = [value] if isinstance(value, dict) else value
+    if not isinstance(bindings, list) or any(not isinstance(item, dict) for item in bindings):
+        raise ValueError('use_image must be an object or ordered array of objects')
+    resolved: list[dict] = []
+    for position, binding in enumerate(bindings, start=1):
+        image = _resolve_inherited_image(
+            ip,
+            {'use_image': binding},
+            deck,
+            page_no,
+            position=position,
+            total=len(bindings),
+        )
+        if image is None:
+            raise ValueError(f'required image {position} cannot be resolved')
+        if 'binding' not in image:
+            image['binding'] = binding
+        resolved.append(image)
+    return resolved
 
 
 def _resolve_background_image(deck: Path, page_no: int) -> dict | None:
@@ -1853,7 +1905,11 @@ def cmd_page_html(deck: Path, page_no: int, *, llm_call=None) -> int:
         return _fail(f"asset_plan missing page {page_no}")
 
     inherited_table = _resolve_inherited_table(ip, page_outline)
-    inherited_image = _resolve_inherited_image(ip, page_outline, deck, page_no)
+    try:
+        inherited_images = _resolve_page_images(ip, page_outline, deck, page_no)
+    except (OSError, ValueError) as exc:
+        return _fail(f'page-html p{page_no}: {exc}', page_no=page_no)
+    inherited_image = inherited_images[0] if inherited_images else None
     background_image = _resolve_background_image(deck, page_no)
 
     # Inherited image: collect every textual hint the upstream pipeline
@@ -1869,7 +1925,7 @@ def cmd_page_html(deck: Path, page_no: int, *, llm_call=None) -> int:
     inherited_image_caption_hint = None
     if inherited_image and inherited_image.get("local_path"):
         inherited_image_size = _read_image_size(deck / inherited_image["local_path"])
-        ref = page_outline.get("use_image") or {}
+        ref = inherited_image.get('binding') or {}
         digest = ip.get("document_digest") or {}
         ua = ip.get("user_assets") or {}
 
@@ -1987,6 +2043,7 @@ def cmd_page_html(deck: Path, page_no: int, *, llm_call=None) -> int:
         rewritten_query,
         page_plan=page_plan,
         inherited_image=inherited_image,
+        inherited_images=inherited_images,
         background_image=background_image,
         prompt_mode=prompt_mode,
         language=_resolve_language(tp, ip),
@@ -2023,7 +2080,11 @@ def cmd_page_html_from_brief(
     if page_plan is None:
         return _fail(f'asset_plan missing page {page_no}')
 
-    inherited_image = _resolve_inherited_image(ip, page_outline, deck, page_no)
+    try:
+        inherited_images = _resolve_page_images(ip, page_outline, deck, page_no)
+    except (OSError, ValueError) as exc:
+        return _fail(f'page-html brief p{page_no}: {exc}', page_no=page_no)
+    inherited_image = inherited_images[0] if inherited_images else None
     background_image = _resolve_background_image(deck, page_no)
     inherited_image_size = None
     if inherited_image and inherited_image.get('local_path'):
@@ -2041,6 +2102,7 @@ def cmd_page_html_from_brief(
         page_query,
         page_plan=page_plan,
         inherited_image=inherited_image,
+        inherited_images=inherited_images,
         background_image=background_image,
         prompt_mode='slide-outline-brief',
         language=_resolve_language(tp, ip),
@@ -2055,6 +2117,7 @@ def _write_page_html_from_query(
     *,
     page_plan: dict,
     inherited_image: dict | None,
+    inherited_images: list[dict] | None = None,
     background_image: dict | None,
     prompt_mode: str,
     language: str,
@@ -2064,6 +2127,25 @@ def _write_page_html_from_query(
     rewritten_query = (rewritten_query or '').strip()
     if not rewritten_query:
         return _fail(f'page-html p{page_no}: empty query', page_no=page_no)
+    resolved_images = list(inherited_images or ([inherited_image] if inherited_image else []))
+    if resolved_images:
+        required_payload = []
+        for image in resolved_images:
+            path = image.get('local_path') or image.get('remote_url')
+            required_payload.append({
+                'path': _page_relative_asset_path(path),
+                'alt': image.get('alt') or None,
+                'size': (
+                    _read_image_size(deck / image['local_path'])
+                    if image.get('local_path') else None
+                ),
+            })
+        rewritten_query += (
+            '\n\nMANDATORY FOREGROUND IMAGES: Render every image below as a visible '
+            '<img> in this exact order. Preserve aspect ratios. Do not replace, '
+            'merge, hide, or convert them into CSS backgrounds.\n'
+            + json.dumps(required_payload, ensure_ascii=False)
+        )
 
     if language == 'zh-Hant':
         lang_hint = (
@@ -2096,18 +2178,21 @@ def _write_page_html_from_query(
 
     html = _sanitize_page_html(html)
 
-    extra_paths: list[str] = []
-    if inherited_image and inherited_image.get('local_path'):
-        extra_paths.append(inherited_image['local_path'])
+    extra_paths = [
+        image['local_path'] for image in resolved_images if image.get('local_path')
+    ]
     html, fixed = _normalize_img_srcs(html, page_plan, extra_paths=extra_paths)
     html, imgs_dropped = _strip_missing_local_imgs(html, deck)
 
-    required_image_path = (inherited_image or {}).get('local_path')
+    required_image_paths = [
+        image.get('local_path') or image.get('remote_url')
+        for image in resolved_images
+        if image.get('local_path') or image.get('remote_url')
+    ]
     required_background_path = (background_image or {}).get('local_path')
     html, background_restored = _restore_background_image(html, required_background_path)
     missing_foreground = bool(
-        required_image_path
-        and not _html_has_foreground_image(html, required_image_path)
+        any(not _html_has_foreground_image(html, path) for path in required_image_paths)
     )
     missing_background = bool(
         required_background_path
@@ -2119,11 +2204,14 @@ def _write_page_html_from_query(
         if invalid_document:
             corrections.append('Return a complete HTML document from <!doctype html> through </html>, not prose, JSON, a fragment, or truncated markup.')
         if missing_foreground:
-            required_src = _page_relative_asset_path(required_image_path)
+            required_srcs = [
+                _page_relative_asset_path(path) for path in required_image_paths
+                if not _html_has_foreground_image(html, path)
+            ]
             corrections.append(
-                'Include exactly one foreground '
-                f'<img src="{required_src}">. It must be clearly visible, must not be a '
-                'CSS background, and must not be covered by a dark/gradient overlay.'
+                'Include one clearly visible foreground <img> for each exact path, '
+                f'in this order: {required_srcs}. They must not be CSS backgrounds '
+                'or covered by a dark/gradient overlay.'
             )
         if missing_background:
             background_src = _page_relative_asset_path(required_background_path)
@@ -2155,8 +2243,12 @@ def _write_page_html_from_query(
         imgs_dropped += retry_dropped
         html, retry_background_restored = _restore_background_image(html, required_background_path)
         background_restored = background_restored or retry_background_restored
-        if required_image_path and not _html_has_foreground_image(html, required_image_path):
-            required_src = _page_relative_asset_path(required_image_path)
+        missing_after_retry = [
+            path for path in required_image_paths
+            if not _html_has_foreground_image(html, path)
+        ]
+        if missing_after_retry:
+            required_src = _page_relative_asset_path(missing_after_retry[0])
             return _fail(
                 f'page-html p{page_no}: required material image {required_src!r} '
                 'was omitted after one repair attempt',

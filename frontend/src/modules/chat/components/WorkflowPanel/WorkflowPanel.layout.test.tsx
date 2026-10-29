@@ -374,6 +374,21 @@ describe('shared workflow compact layout', () => {
     expect(screen.getByRole('button', { name: '重试' })).toBeEnabled();
   });
 
+  it('shows a system interruption without any execution control', async () => {
+    fixture.session.status = 'active';
+    fixture.session.steps = fixture.session.steps!.map(step => step.step_id === 'write_document'
+      ? { ...step, status: 'interrupted' } : step);
+    fixture.session.projection!.display = {
+      status: 'interrupted', reason: 'execution_interrupted', approval_step_id: '',
+    };
+    render(<WorkflowPanel conversationId='layout-test' />);
+
+    expect(await screen.findByText(String(i18n.t('chat.workflowStatusInterrupted')))).toBeVisible();
+    expect(screen.queryByRole('button', { name: String(i18n.t('chat.workflowStop')) })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: String(i18n.t('chat.workflowContinue')) })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: String(i18n.t('chat.workflowRetry')) })).not.toBeInTheDocument();
+  });
+
   it.each([false, true])('pauses only the workflow while Chat busy=%s', async chatBusy => {
     fixture.session.status = 'active';
     fixture.session.projection!.display = {

@@ -1,7 +1,7 @@
 export type WorkflowSessionStatus = 'active' | 'pausing' | 'completed' | 'failed' | 'waiting' | 'stopped';
 
 export interface WorkflowDisplayState {
-  status: 'running' | 'waiting' | 'paused' | 'failed' | 'completed';
+  status: 'running' | 'waiting' | 'paused' | 'interrupted' | 'failed' | 'completed';
   reason: string;
   approval_step_id: string;
   /** Native Chat turn owning cancellation, including after workflow hand-off. */
@@ -11,7 +11,7 @@ export interface WorkflowDisplayState {
 const displayLabels: Record<WorkflowDisplayState['status'], string> = {
   running: 'chat.workflowStatusRunning', waiting: 'chat.workflowStatusWaiting',
   paused: 'chat.workflowStatusPaused', failed: 'chat.workflowStatusFailed',
-  completed: 'chat.workflowStatusDone',
+  interrupted: 'chat.workflowStatusInterrupted', completed: 'chat.workflowStatusDone',
 };
 export const workflowDisplayLabel = (status?: WorkflowDisplayState['status']): string => status ? displayLabels[status] : 'common.loading';
 

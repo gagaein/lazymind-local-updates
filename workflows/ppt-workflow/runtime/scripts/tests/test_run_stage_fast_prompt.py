@@ -106,6 +106,28 @@ class StyleRenderingRecipeTest(unittest.TestCase):
         self.assertEqual(state['steps']['generate_backgrounds']['mode'], 'human')
         self.assertEqual(state['steps']['generate_ppt']['mode'], 'human')
 
+    def test_source_read_is_split_between_requirement_scan_and_frozen_deep_read(self) -> None:
+        state_path = Path(__file__).resolve().parents[3] / 'scenario' / 'state.yml'
+        state = yaml.safe_load(state_path.read_text(encoding='utf-8'))
+
+        analyze = state['steps']['analyze_requirements']
+        collect_materials = state['steps']['collect_materials']
+        self.assertIn('ppt_prepare_source_document', analyze['tools'])
+        self.assertIn('source_bundle', [
+            item['material'] for item in analyze['outputs']
+        ])
+        self.assertNotIn('ppt_import_source_document', collect_materials['tools'])
+        self.assertIn('ppt_read_source_document', collect_materials['tools'])
+        self.assertIn('ppt_materialize_source_images', collect_materials['tools'])
+        self.assertIn('source_bundle', [
+            item['material'] for item in collect_materials['inputs']
+        ])
+        self.assertNotIn('source_bundle', [
+            item['material'] for item in collect_materials['outputs']
+        ])
+        self.assertEqual(analyze['capabilities'], ['feishu'])
+        self.assertEqual(collect_materials['capabilities'], ['feishu'])
+
     def test_background_prompt_and_generation_steps_support_skip_and_targeted_rerun(self) -> None:
         workflow_path = Path(__file__).resolve().parents[3] / 'workflow.yaml'
         state_path = workflow_path.parent / 'scenario' / 'state.yml'
@@ -191,9 +213,13 @@ class StyleRenderingRecipeTest(unittest.TestCase):
 
     def test_analyze_runs_conditional_background_capability_gate(self) -> None:
         workflow_path = Path(__file__).resolve().parents[3] / 'workflow.yaml'
+        state_path = workflow_path.parent / 'scenario' / 'state.yml'
         workflow = yaml.safe_load(workflow_path.read_text(encoding='utf-8'))
+        state = yaml.safe_load(state_path.read_text(encoding='utf-8'))
         checks = workflow['runtime']['post_step_checks']
         slots = {slot['id']: slot for slot in workflow['slots']}
+        analyze = state['steps']['analyze_requirements']
+        normalized_prompt = ' '.join(analyze['prompt'].split())
 
         self.assertEqual(checks, [{
             'step_id': 'analyze_requirements',
@@ -207,6 +233,27 @@ class StyleRenderingRecipeTest(unittest.TestCase):
         self.assertFalse(slots['ppt_capability_requirements']['exposed'])
         self.assertFalse(slots['style_flow']['exposed'])
         self.assertFalse(slots['generate_background_images']['exposed'])
+        self.assertEqual(
+            analyze['tools'],
+            [
+                'read_user_attachment',
+                'ppt_prepare_source_document',
+                'ppt_publish_requirement_analysis',
+            ],
+        )
+        self.assertEqual(
+            analyze['terminal_tools'], ['ppt_publish_requirement_analysis'],
+        )
+        self.assertIn(
+            'ppt_publish_requirement_analysis exactly once', normalized_prompt,
+        )
+        self.assertIn(
+            'Do not call save_artifacts', normalized_prompt,
+        )
+        self.assertIn(
+            'ppt_publish_requirement_analysis',
+            workflow['tool_scripts'][0]['functions'],
+        )
 
 
 class OutlineReferenceImageRepairTest(unittest.TestCase):
@@ -218,10 +265,10 @@ class OutlineReferenceImageRepairTest(unittest.TestCase):
 
         repaired = run_stage._ensure_outline_reference_images(pages, [])
 
-        self.assertEqual(repaired, 1)
-        self.assertEqual([page["use_image"] for page in pages], [None, None])
+        self.assertEqual(repaired, 2)
+        self.assertEqual([page["use_image"] for page in pages], [[], []])
 
-    def test_repairs_prose_only_material_reference_and_fills_other_pages(self) -> None:
+    def test_repairs_only_prose_named_material_reference(self) -> None:
         pages = [
             {"page_no": 1, "visual_hints": "封面", "use_image": None},
             {
@@ -240,11 +287,11 @@ class OutlineReferenceImageRepairTest(unittest.TestCase):
         repaired = run_stage._ensure_outline_reference_images(pages, images)
 
         self.assertEqual(repaired, 3)
-        self.assertEqual(pages[1]["use_image"], {"reference_image_index": 2})
-        self.assertEqual(pages[0]["use_image"], {"reference_image_index": 0})
-        self.assertEqual(pages[2]["use_image"], {"reference_image_index": 1})
+        self.assertEqual(pages[1]["use_image"], [{"reference_image_index": 2}])
+        self.assertEqual(pages[0]["use_image"], [])
+        self.assertEqual(pages[2]["use_image"], [])
 
-    def test_collapses_model_generated_image_arrays_to_one_image_per_page(self) -> None:
+    def test_preserves_ordered_multi_image_bindings(self) -> None:
         pages = [
             {
                 "page_no": 1,
@@ -275,17 +322,17 @@ class OutlineReferenceImageRepairTest(unittest.TestCase):
 
         repaired = run_stage._ensure_outline_reference_images(pages, images)
 
-        self.assertEqual(repaired, 3)
+        self.assertEqual(repaired, 0)
         self.assertEqual(
             [page["use_image"] for page in pages],
             [
-                {"reference_image_index": 0},
-                {"reference_image_index": 2},
-                {"reference_image_index": 4},
+                [{"reference_image_index": 0}, {"reference_image_index": 1}],
+                [{"reference_image_index": 2}, {"reference_image_index": 3}],
+                [{"reference_image_index": 4}, {"reference_image_index": 5}],
             ],
         )
 
-    def test_preserves_pool_a_and_repairs_invalid_or_duplicate_pool_b(self) -> None:
+    def test_normalizes_legacy_objects_and_drops_invalid_optional_binding(self) -> None:
         pages = [
             {"page_no": 1, "use_image": {"doc_index": 0, "image_index": 1}},
             {"page_no": 2, "use_image": {"reference_image_index": 4}},
@@ -299,11 +346,23 @@ class OutlineReferenceImageRepairTest(unittest.TestCase):
 
         repaired = run_stage._ensure_outline_reference_images(pages, images)
 
-        self.assertEqual(repaired, 3)
-        self.assertEqual(pages[0]["use_image"], {"doc_index": 0, "image_index": 1})
-        self.assertEqual(pages[1]["use_image"], {"reference_image_index": 4})
-        self.assertEqual(pages[2]["use_image"], {"reference_image_index": 7})
-        self.assertIsNone(pages[3]["use_image"])
+        self.assertEqual(repaired, 4)
+        self.assertEqual(pages[0]["use_image"], [{"doc_index": 0, "image_index": 1}])
+        self.assertEqual(pages[1]["use_image"], [{"reference_image_index": 4}])
+        self.assertEqual(pages[2]["use_image"], [{"reference_image_index": 4}])
+        self.assertEqual(pages[3]["use_image"], [])
+
+    def test_fails_when_required_source_image_is_not_bound(self) -> None:
+        pages = [{"page_no": 1, "use_image": []}]
+        images = [{
+            "reference_image_index": 0,
+            "basename": "source_01.png",
+            "asset_id": "source-image-1",
+            "required": True,
+        }]
+
+        with self.assertRaisesRegex(ValueError, 'source-image-1'):
+            run_stage._ensure_outline_reference_images(pages, images)
 
 
 class PagePromptModeTest(unittest.TestCase):
@@ -366,6 +425,49 @@ class PagePromptModeTest(unittest.TestCase):
             'pages': [{'page_no': 1, 'local_path': relative}],
         }), encoding='utf-8')
         return relative
+
+    def test_multiple_required_images_are_rendered_in_order(self) -> None:
+        pixel = base64.b64decode(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII='
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            deck = self._deck(root)
+            sources = [root / 'first.png', root / 'second.png']
+            for source in sources:
+                source.write_bytes(pixel)
+            info = json.loads((deck / 'info_pack.json').read_text(encoding='utf-8'))
+            info['user_assets'] = {'reference_images': [str(path) for path in sources]}
+            (deck / 'info_pack.json').write_text(json.dumps(info), encoding='utf-8')
+            outline = json.loads((deck / 'outline.json').read_text(encoding='utf-8'))
+            outline['pages'][0]['use_image'] = [
+                {'reference_image_index': 0}, {'reference_image_index': 1},
+            ]
+            (deck / 'outline.json').write_text(json.dumps(outline), encoding='utf-8')
+            html = """<!DOCTYPE html><html><head></head><body><div class='wrapper'><div id='ct'>
+            <img src='../images/page_001_inherited_01.png'>
+            <img src='../images/page_001_inherited_02.png'>
+            </div></div></body></html>"""
+            calls: list[str] = []
+
+            def fake_llm(_system: str, user: str, **_kwargs) -> str:
+                calls.append(user)
+                return html
+
+            with patch.object(run_stage, 'llm', side_effect=fake_llm):
+                self.assertEqual(run_stage.cmd_page_html(deck, 1), 0)
+
+            self.assertEqual(len(calls), 1)
+            first = calls[0].index('page_001_inherited_01.png')
+            second = calls[0].index('page_001_inherited_02.png')
+            self.assertLess(first, second)
+            rendered = (deck / 'pages' / 'page_001.html').read_text(encoding='utf-8')
+            self.assertTrue(run_stage._html_has_foreground_image(
+                rendered, 'images/page_001_inherited_01.png',
+            ))
+            self.assertTrue(run_stage._html_has_foreground_image(
+                rendered, 'images/page_001_inherited_02.png',
+            ))
 
     def test_generated_background_is_mandatory_in_page_css(self) -> None:
         calls: list[tuple[str, str]] = []
@@ -546,7 +648,11 @@ class CombinedStyleOutlineTest(unittest.TestCase):
                     'design_style': {'id': 3}, 'palette': {'primary': '#008000'},
                     'typography': {'heading_font': 'Arial'},
                 },
-                'outline': {'pages': [{'page_no': 1, 'title': '周末'}]},
+                'outline': {'pages': [{
+                    'page_no': 1,
+                    'title': '周末',
+                    'use_image': {'reference_image_index': 0},
+                }]},
             })) as model:
                 code, result = run_stage._capture_cmd(run_stage.cmd_outline, deck, generate_style=True)
             self.assertEqual(code, 0)
@@ -554,7 +660,7 @@ class CombinedStyleOutlineTest(unittest.TestCase):
             style = json.loads((deck / 'style_spec.json').read_text())
             self.assertIn('art_direction', style)
             page = json.loads((deck / 'outline.json').read_text())['pages'][0]
-            self.assertEqual(page['use_image']['reference_image_index'], 0)
+            self.assertEqual(page['use_image'], [{'reference_image_index': 0}])
 
     def test_combined_stage_does_not_bypass_standard_style_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -613,7 +719,14 @@ class DeferredStyleTest(unittest.TestCase):
                 'user_query': '米白绿色，大图少字',
                 'user_assets': {'reference_images': [str(image)]},
             }))
-            with patch.object(run_stage, 'llm', return_value='{"pages":[{"title":"周末"}]}') as model:
+            with patch.object(
+                run_stage,
+                'llm',
+                return_value=(
+                    '{"pages":[{"title":"周末","use_image":'
+                    '{"reference_image_index":0}}]}'
+                ),
+            ) as model:
                 code, _ = run_stage._capture_cmd(run_stage.cmd_outline, deck, content_only=True)
             self.assertEqual(code, 0)
             self.assertFalse((deck / 'style_spec.json').exists())
@@ -621,8 +734,10 @@ class DeferredStyleTest(unittest.TestCase):
             self.assertNotIn('=== style_spec requirements ===', system)
             self.assertEqual(json.loads(query)['style_spec'], {})
             self.assertIn('米白绿色', query)
-            self.assertEqual(json.loads((deck / 'outline.json').read_text())['pages'][0]['use_image'],
-                             {'reference_image_index': 0})
+            self.assertEqual(
+                json.loads((deck / 'outline.json').read_text())['pages'][0]['use_image'],
+                [{'reference_image_index': 0}],
+            )
 
     def test_style_failure_preserves_outline_then_retry_reuses_success(self):
         with tempfile.TemporaryDirectory() as tmp:

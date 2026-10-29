@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { reconcileWorkflowSessionStatus } from './workflowStatus';
+import { reconcileWorkflowSessionStatus, workflowDisplayLabel } from './workflowStatus';
 
 describe('reconcileWorkflowSessionStatus', () => {
+  it('labels a system interruption independently from pause and failure', () => {
+    expect(workflowDisplayLabel('interrupted')).toBe('chat.workflowStatusInterrupted');
+  });
   it('does not infer a completed pause from an interrupted attempt', () => {
     expect(reconcileWorkflowSessionStatus('active', {
       status: 'pausing', current: ['edit'],

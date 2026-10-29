@@ -32,7 +32,7 @@ var OnConversationTrashHook func(convID string)
 
 const taskExecutionTimeoutReason = "任务执行超过2小时，未正常完成"
 
-var terminalTaskStatuses = []string{"succeeded", "failed", "skipped", "canceled"}
+var terminalTaskStatuses = []string{"succeeded", "failed", "interrupted", "skipped", "canceled"}
 
 const (
 	ArchivedReasonTaskRemove          = "task_remove"
