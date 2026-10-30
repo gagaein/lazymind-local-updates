@@ -149,6 +149,18 @@ def test_remote_executor_ignores_non_json_stream_frames():
     assert RemoteWorkflowExecutor._parse_frame('event: heartbeat\n\n') is None
 
 
+def test_heartbeat_retries_transient_failures_but_stops_on_fencing():
+    timeout = httpx.ReadTimeout('temporary transport failure')
+    assert not RemoteWorkflowExecutor._heartbeat_failure_is_terminal(timeout, 1, 3)
+    assert not RemoteWorkflowExecutor._heartbeat_failure_is_terminal(timeout, 2, 3)
+    assert RemoteWorkflowExecutor._heartbeat_failure_is_terminal(timeout, 3, 3)
+
+    request = httpx.Request('POST', 'http://core/heartbeat')
+    response = httpx.Response(409, request=request)
+    fenced = httpx.HTTPStatusError('fenced', request=request, response=response)
+    assert RemoteWorkflowExecutor._heartbeat_failure_is_terminal(fenced, 1, 3)
+
+
 @pytest.mark.asyncio
 async def test_remote_event_failure_closes_subagent_inside_execution_scope(monkeypatch, tmp_path):
     from types import SimpleNamespace
@@ -1005,6 +1017,7 @@ async def test_lease_loss_cancels_subagent_and_suppresses_stale_terminal(monkeyp
     worker = RemoteWorkflowExecutor()
     worker.heartbeat_seconds = 0.01
     cancelled = threading.Event()
+    cancel_requests = []
 
     class Runtime(StopReceiptRuntime):
         terminal_calls = 0
@@ -1037,9 +1050,18 @@ async def test_lease_loss_cancels_subagent_and_suppresses_stale_terminal(monkeyp
     runtime = Runtime()
     worker.runtime = runtime
     monkeypatch.setattr(runner, 'run_subagent_stream', stream)
-    monkeypatch.setattr(worker, '_cancel_subagent', lambda _task: cancelled.set())
-    await worker._run_claim(object(), {'attempt_id': 'attempt-1', 'lease_token': 'lease-1'})
+    def cancel(task_id, execution=None, *, reason='user'):
+        cancel_requests.append((task_id, execution, reason))
+        cancelled.set()
+
+    monkeypatch.setattr(worker, '_cancel_subagent', cancel)
+    await worker._run_claim(object(), {
+        'attempt_id': 'attempt-1', 'lease_token': 'lease-1', 'fencing_generation': 7,
+    })
     assert cancelled.is_set()
+    assert cancel_requests == [(
+        'task-1', {'attempt_id': 'attempt-1', 'generation': '7'}, 'lease_lost',
+    )]
     assert runtime.terminal_calls == 0
 
 

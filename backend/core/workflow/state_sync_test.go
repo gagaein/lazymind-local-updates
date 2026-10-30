@@ -196,6 +196,30 @@ func TestChatPauseScopesWorkflowAndProtectsLateDriverCallbacks(t *testing.T) {
 	}
 }
 
+func TestInterruptedWorkflowProtectsAgainstLateDriverCallbacks(t *testing.T) {
+	db := newTestDB(t)
+	session := orm.WorkflowSession{ID: "interrupted", ConversationID: "chat", CreateUserID: "owner",
+		WorkflowID: "workflow", Status: "active"}
+	step := orm.WorkflowSessionStep{ID: "attempt", SessionID: session.ID, StepID: "generate", Attempt: 1,
+		Status: "interrupted", TerminalCode: "WORKFLOW_STOPPED", Validity: "effective", CreatedAt: time.Now().UTC()}
+	for _, value := range []any{&session, &step} {
+		if err := db.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if admitted, err := prepareContinuation(t.Context(), db.DB, session.ID); err != nil || admitted {
+		t.Fatalf("late driver resumed interrupted workflow: admitted=%v err=%v", admitted, err)
+	}
+	stored, err := GetSession(t.Context(), db.DB, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := displaystate.Read(db.DB, *stored)
+	if err != nil || view.Status != "interrupted" {
+		t.Fatalf("interrupted state changed: view=%+v err=%v", view, err)
+	}
+}
+
 func TestPauseWaitsForEveryExecutorAndRejectsWrongReceipt(t *testing.T) {
 	db := newTestDB(t)
 	if err := db.AutoMigrate(&orm.TaskExecutionTiming{}, &orm.TaskAttemptTiming{}); err != nil {

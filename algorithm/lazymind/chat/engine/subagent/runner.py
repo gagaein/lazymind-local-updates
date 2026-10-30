@@ -38,6 +38,7 @@ from lazymind.chat.engine.agent_runtime import (
     normalize_attachments,
     render_attachment_content,
     make_cancel_stop_condition,
+    ExecutionCancelledError,
     UserCancelledError,
 )
 from lazymind.chat.engine.prompts import add_standard_system_sections
@@ -1814,6 +1815,12 @@ async def run_subagent_stream(
             'summary': summary, 'cost': cost,
             **({'control': workflow_control} if workflow_control else {}),
         })
+        yield 'data: [DONE]\n\n'
+    except ExecutionCancelledError as exc:
+        for event in _rollback_open_output(RunOutcome.CANCELLED):
+            yield _sse(event)
+        yield _sse({'type': 'done', 'task_id': task_id, 'status': 'interrupted',
+                    'summary': str(exc) or 'workflow execution interrupted'})
         yield 'data: [DONE]\n\n'
     except UserCancelledError:
         for event in _rollback_open_output(RunOutcome.CANCELLED):

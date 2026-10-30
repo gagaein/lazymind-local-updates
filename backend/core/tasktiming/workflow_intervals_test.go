@@ -10,6 +10,30 @@ import (
 	"lazymind/core/workflow/displaystate"
 )
 
+func TestSystemInterruptedWorkflowFreezesClock(t *testing.T) {
+	db := orm.MigrateTestDB(t, &orm.TaskExecutionTiming{}, &orm.TaskAttemptTiming{}, &orm.WorkflowSession{}, &orm.WorkflowSessionStep{})
+	start := time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC)
+	session := orm.WorkflowSession{ID: "workflow", ConversationID: "conv", CreateUserID: "owner", Status: "active"}
+	for _, err := range []error{
+		db.Create(&session).Error,
+		Begin(t.Context(), db.DB, "execution", "history", "conv", "owner", start),
+		BindWorkflow(t.Context(), db.DB, session, start),
+		RecordAttempt(t.Context(), db.DB, "execution", "attempt", start.Add(2*time.Second), ptr(start.Add(10*time.Second))),
+		db.Create(&orm.WorkflowSessionStep{ID: "attempt", SessionID: session.ID, StepID: "generate", Status: "interrupted",
+			TerminalCode: "WORKFLOW_STOPPED", Validity: "effective", Attempt: 1, CreatedAt: start.Add(2 * time.Second), UpdatedAt: start.Add(10 * time.Second)}).Error,
+		SyncWorkflow(t.Context(), db.DB, session.ID, start.Add(10*time.Second)),
+	} {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	run, err := Snapshot(t.Context(), db.DB, "owner", "conv", session.ID, start.Add(time.Minute))
+	if err != nil || run == nil || run.Status != "interrupted" || run.Timing.FinishedAt == nil ||
+		*run.Timing.ElapsedMS != 10000 || *run.Timing.CumulativeExecutionMS != 8000 {
+		t.Fatalf("interruption did not freeze clock: run=%+v err=%v", run, err)
+	}
+}
+
 func TestWorkflowFailureFreezesInternalWaitingAndRetryExcludesIdleTime(t *testing.T) {
 	for _, stepStatus := range []string{"interrupted", "failed", "succeeded"} {
 		t.Run(stepStatus, func(t *testing.T) {

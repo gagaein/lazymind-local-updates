@@ -786,12 +786,15 @@ func TestStopActiveWorkflowSession_CancelsAllPendingAndRunningAttempts(t *testin
 		if step.Status != StepStatusInterrupted {
 			t.Errorf("step %s status = %q, want interrupted", taskID, step.Status)
 		}
-		if step.LeaseExpiresAt != nil {
-			t.Errorf("step %s retained a lease after stop", taskID)
-		}
 		expectedCode := "WORKFLOW_STOPPED"
 		if taskID == "stop-task-running" || step.LeaseToken != "" {
 			expectedCode = "WORKFLOW_STOP_REQUESTED"
+		}
+		if expectedCode == "WORKFLOW_STOP_REQUESTED" && step.LeaseExpiresAt == nil {
+			t.Errorf("step %s lost the lease needed for stop recovery", taskID)
+		}
+		if expectedCode == "WORKFLOW_STOPPED" && step.LeaseExpiresAt != nil {
+			t.Errorf("step %s retained a lease after final stop", taskID)
 		}
 		if step.TerminalCode != expectedCode {
 			t.Errorf("step %s terminal code = %q, want %s", taskID, step.TerminalCode, expectedCode)

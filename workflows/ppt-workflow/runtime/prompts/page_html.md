@@ -12,8 +12,8 @@
 
 ## 素材图片数量（硬性）
 
-每页最多使用指定的一张内容素材图片，只放置一次；不新增其他素材图，不重复图片，不做多图拼贴。
-AI 底图属于单独的背景层，不计入这一张内容素材图。没有可用素材时使用文字、CSS/SVG 或有依据的图表，
+本页内容素材图片的数量、路径和顺序以 user message 的实际绑定清单为准；每个绑定项放置一次，不新增清单外的素材图，不擅自重复或省略。
+AI 底图属于单独的背景层，不计入内容素材图数量。没有可用素材时使用文字、CSS/SVG 或有依据的图表，
 不虚构图片 URL，也不渲染空白图片占位；用户明确要求但缺失的指定图片不得伪称已提供。
 
 ## 语言锁定（硬性）
@@ -72,7 +72,7 @@ HTML 中**所有面向读者可见的文字内容**（`<title>`、标题、副�
 ## 图片引用
 
 - 所有 `<img src>` 必须使用相对路径 `../images/<basename>`，其中 `<basename>` 来自 user message 给出的路径（例如 `../images/page_003_inherited.png`）。
-- user message 中只要出现 `INHERITED FOREGROUND IMAGE`，其中的 `path` 就是本页已经由素材收集阶段选定并复制好的图片。**必须原样生成且只生成一个 `<img src="该 path">`**；输出结束前检查该 `<img>` 确实存在。禁止只创建 `.image-section`、`.image-placeholder` 等空容器来代替图片。
+- user message 中的 `MANDATORY FOREGROUND IMAGES` 是本页完整的前景素材绑定清单，须按清单顺序为每个绑定项生成一个可见的 `<img src="该 path">`。`INHERITED FOREGROUND IMAGE` 中的 `path` 是其中一个绑定项，单图时也适用；同一绑定项不因两处描述而重复放置。输出结束前检查全部绑定图片均已呈现。禁止只创建 `.image-section`、`.image-placeholder` 等空容器来代替图片。
 - user message 中只要出现 `AI BACKGROUND IMAGE`，其中的 `path` 是专用底图，不属于继承素材。必须把精确路径写入 `#bg` 的 `background-image: url(...)`，并设置 `background-size: cover; background-position: center;`；不得把它输出成前景 `<img>`。
 - **若 user message 没有给出任何可用图片路径，禁止输出任何 `<img>` 标签**（包括用生图 prompt 当 alt、编造文件名）。改用 CSS / SVG / ECharts 做视觉。
 - 禁止 `file://` / 绝对路径 / 未提供的 CDN 或远程 URL / 自己编造的文件名 / 基于自己想象的 `/mnt/data/...` 路径。

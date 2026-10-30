@@ -158,13 +158,36 @@ func TestLinkedTaskUsesWorkflowLifecycleWithoutRevivingCanceledTasks(t *testing.
 	}
 }
 
+func TestInterruptedWorkflowIsTerminalWithoutOfferingExecution(t *testing.T) {
+	db := orm.MigrateTestDB(t, &orm.TaskCenterTask{}, &orm.WorkflowSession{}, &orm.WorkflowSessionStep{})
+	now := time.Now().UTC()
+	session := orm.WorkflowSession{ID: "interrupted-workflow", ConversationID: "conv", CreateUserID: "owner",
+		WorkflowID: "writer", Status: "active", CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
+	step := orm.WorkflowSessionStep{ID: "interrupted-attempt", SessionID: session.ID, StepID: "write",
+		Status: "interrupted", TerminalCode: "WORKFLOW_STOPPED", Validity: "effective", Attempt: 1, CreatedAt: now.Add(-time.Second), UpdatedAt: now}
+	for _, value := range []any{&session, &step} {
+		if err := db.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	task := orm.TaskCenterTask{ID: "background", UserID: "owner", ConversationID: "conv",
+		TaskType: "workflow_run", WorkflowSessionID: &session.ID, Status: "running", CreatedAt: session.CreatedAt}
+	got, err := resolveTaskForResponse(t.Context(), db.DB, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "interrupted" || got.FinishedAt == nil || !isTerminal(got.Status) {
+		t.Fatalf("interrupted workflow must stay terminal: %#v", got)
+	}
+}
+
 func TestStoppedWorkflowIsPausedUntilExplicitRetry(t *testing.T) {
 	db := orm.MigrateTestDB(t, &orm.TaskCenterTask{}, &orm.Conversation{}, &orm.UserSchedule{},
 		&orm.WorkflowSession{}, &orm.WorkflowSessionStep{}, &orm.SubAgentTask{}, &orm.SubAgentArtifact{})
 	store.Init(db.DB, nil, nil)
 	t.Cleanup(func() { store.Init(nil, nil, nil) })
 	now := time.Now().UTC().Add(-time.Minute)
-	session := orm.WorkflowSession{ID: "stopped-workflow", ConversationID: "conv", CreateUserID: "owner", WorkflowID: "writer", Status: "waiting", CreatedAt: now, UpdatedAt: now}
+	session := orm.WorkflowSession{ID: "stopped-workflow", ConversationID: "conv", CreateUserID: "owner", WorkflowID: "writer", Status: "waiting", LastStoppedAt: &now, CreatedAt: now, UpdatedAt: now}
 	task := orm.TaskCenterTask{ID: "stopped-task", UserID: "owner", ConversationID: "conv", TaskType: "workflow_run", WorkflowSessionID: &session.ID, Status: "running", CreatedAt: now, UpdatedAt: now}
 	conversation := orm.Conversation{ID: "conv", BaseModel: orm.BaseModel{CreateUserID: "owner"}}
 	stopped := orm.WorkflowSessionStep{ID: "stopped-attempt", SessionID: session.ID, StepID: "write", TaskID: "subtask", Attempt: 1, Status: "interrupted", TerminalCode: "WORKFLOW_STOPPED", CreatedAt: now, UpdatedAt: now}

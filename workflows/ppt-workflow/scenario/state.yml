@@ -63,6 +63,8 @@ steps:
     label: Analyze Requirements
     mode: auto
     route: choice
+    capabilities:
+      - feishu
     prompt: |
       You are a senior presentation strategist.
 
@@ -83,6 +85,17 @@ steps:
       - Do NOT search or call a knowledge base in this step. When the user asks
         to use a knowledge base, record that requirement clearly;
         collect_materials is the only step that performs KB retrieval.
+      - When the authoritative request contains a supported cloud-document URL
+        that the user wants this deck to use, call ppt_prepare_source_document
+        exactly once before writing the requirement brief. It freezes the exact
+        provider revision and scans every structured text block for requirements,
+        but does not download or understand image bytes.
+      - Use requirement_scan.requirements to collect every explicit source
+        requirement. When none are found, use only requirement_scan.concept for
+        a high-level understanding here; do not deeply summarize the whole body.
+        The next step will deeply read this same frozen body without refetching it.
+      - If the explicit cloud source cannot be read, report that error and stop.
+        Do not silently replace it with a knowledge base or public web content.
 
       Input availability rule:
       - A user upload is NOT required. For a text-only request, immediately
@@ -144,52 +157,34 @@ steps:
       usable numbers and claims into the brief. collect_materials will reuse
       these facts and may complete without any network search.
 
-      Save the result:
-        save_artifact(key='requirement_analysis', content_type='text', value=<analysis>)
-        save_artifact(
-          key='ppt_capability_requirements',
-          content_type='text',
-          value='AI_BACKGROUND_IMAGES: enabled' if the startup answer enabled
-                per-slide AI backgrounds, otherwise
-                'AI_BACKGROUND_IMAGES: disabled',
-        )
-        save_artifact(
-          key='style_flow', content_type='text',
-          value='auto' for direct generation, otherwise 'preview_choice',
-        )
-        save_artifact(
-          key='generate_background_images', content_type='text',
-          value='enabled' if AI backgrounds are enabled, otherwise 'disabled',
-        )
-        When and only when style_flow is auto, also save:
-          save_artifact(
-            key='skip_style_choices', content_type='text', value='skip',
-          )
-        When and only when AI background generation is disabled, also save:
-          save_artifact(
-            key='skip_background_images', content_type='text', value='skip',
-          )
-
-        Also decide whether to skip material collection. Save:
-          save_artifact(
-            key='skip_material_collection', content_type='text', value='skip',
-          )
-        when ALL of these are true:
+      Decide whether material collection can be skipped. Set
+      skip_material_collection=true only when ALL of these are true:
         - the request is self-contained and uses common, stable knowledge;
         - there is no uploaded source, selected/mentioned knowledge base, or
           pasted source material that needs processing;
         - the user did not request research, current facts, citations, real
           photos, product/industry evidence, cases, data, or reference images.
-        Examples that should skip: a short children's holiday introduction,
-        a simple classroom deck, or a basic concept explainer whose topic,
-        audience, page count, and style are already known. Do not save this
-        marker for research/report/product/case-study decks or any request that
-        needs source-grounded claims or foreground visual assets.
+      Examples that should skip: a short children's holiday introduction,
+      a simple classroom deck, or a basic concept explainer whose topic,
+      audience, page count, and style are already known. Use false for
+      research/report/product/case-study decks or any request that needs
+      source-grounded claims or foreground visual assets.
 
-      Use exactly one of those two capability marker values. Do not add prose,
-      punctuation, Markdown, or any other capability to that hidden artifact.
-      After both artifacts are saved, Executor runs the deterministic model
-      capability check. Stop after saving. Do not call advance tools yourself.
+      Call ppt_publish_requirement_analysis exactly once with the completed
+      requirement_analysis, exact style_flow (auto or preview_choice), exact
+      generate_background_images value (enabled or disabled), and the Boolean
+      skip_material_collection decision. This package tool publishes the
+      semantic choices in one validated batch and derives ppt_capability_requirements,
+      skip_style_choices, and skip_background_images. Do not call
+      save_artifacts or write any of those derived control markers yourself.
+      Stop immediately after the tool succeeds. Executor then runs the
+      deterministic model capability check; do not call advance tools yourself.
+    tools:
+      - read_user_attachment
+      - ppt_prepare_source_document
+      - ppt_publish_requirement_analysis
+    terminal_tools:
+      - ppt_publish_requirement_analysis
     outputs:
       - material: requirement_analysis
       - material: ppt_capability_requirements
@@ -201,6 +196,8 @@ steps:
         required: false
       - material: skip_material_collection
         required: false
+      - material: source_bundle
+        required: false
     acceptance_criteria: |
       requirement_analysis must be saved and must cover goal, presentation
       topic, exact slide count, target customer/audience, communication tone,
@@ -208,6 +205,10 @@ steps:
       ppt_capability_requirements must be exactly AI_BACKGROUND_IMAGES: enabled
       or AI_BACKGROUND_IMAGES: disabled. style_flow must be exactly auto or
       preview_choice and must not be inferred from the background setting.
+      The package publisher must derive every applicable skip marker from those
+      semantic choices; the model must not write a derived marker directly.
+      For an explicit supported cloud source, source_bundle must bind one exact
+      revision, report full-block scan coverage, and download zero image bytes.
       Executor must run the configured
       deterministic check exactly once before this Attempt can pass.
 
@@ -215,6 +216,8 @@ steps:
     label: Collect Materials
     mode: auto
     route: choice
+    capabilities:
+      - feishu
     prompt: |
       You are a presentation research and material collection assistant.
 
@@ -235,6 +238,24 @@ steps:
       execution context and bound prior artifacts to retain the existing requirements.
 
       {{runtime_instruction}}
+
+      First call ppt_get_planning_context exactly once. Use its resolved
+      requirement_analysis instead of relying on the empty prompt placeholder.
+      When source_document is bound, deeply read the frozen original body by
+      calling ppt_read_source_document(start_index=0). Continue with each
+      returned next_index until eof=true. Do not summarize before eof and never
+      call a provider loader, URL fetcher, or attachment reader for that same
+      cloud document. This is the careful reading pass over the one body frozen
+      in analyze_requirements, not a second Feishu read.
+
+      Compare presentation_contract.requirements with requirement_analysis. If
+      the deep read exposes a hard source constraint omitted in the first step,
+      list it explicitly under "第一步遗漏的硬约束" in material_summary; never
+      silently discard it. Then call ppt_materialize_source_images exactly once.
+      It downloads the frozen source image tickets without refetching the body and
+      without image understanding. If a required source image cannot be
+      materialized, report that error and stop. Do not replace an explicit
+      source with public web content unless the user allowed that fallback.
 
       Collect facts and, when readily available and useful, optional visual
       assets that should guide the presentation.
@@ -368,6 +389,9 @@ steps:
 
       Stop after saving.
     tools:
+      - ppt_get_planning_context
+      - ppt_read_source_document
+      - ppt_materialize_source_images
       - kb
       - knowledge_management
       - web_search
@@ -380,14 +404,21 @@ steps:
         required: true
       - material: uploaded_materials
         required: false
+      - material: source_bundle
+        required: false
     outputs:
       - material: material_summary
         required: true
+      - material: source_read_complete
+        required: false
       - material: material_images
         required: false
     acceptance_criteria: |
       material_summary must be saved and must identify uploaded-file findings
       when files are present, references, useful evidence, gaps, and assumptions.
+      When source_bundle is present, source_read_complete must prove the exact
+      frozen revision was read through eof; provider document text must not be
+      fetched again. Any first-step hard-requirement miss must be surfaced.
       material_images is optional. Its absence must never fail or retry this
       step; a text-only material_summary is sufficient. When usable KB/web/AI
       material images were found, they should be
@@ -423,6 +454,11 @@ steps:
 
       {{runtime_instruction}}
 
+      First call ppt_get_planning_context exactly once and use its bound
+      requirement_analysis, material_summary and source-document contract when
+      preparing the three previews. Do not reconstruct those inputs from chat
+      memory or from prompt placeholders.
+
       Call ppt_prepare_style_choices exactly once. Pass the merged request,
       positive page count, audience/scene, only the user's explicit style
       direction as style_hint, generate_background_images=true only when the
@@ -439,12 +475,15 @@ steps:
       or C, then clicking Save and Continue. Do not ask the user to edit JSON.
       Stop immediately after ppt_prepare_style_choices succeeds.
     tools:
+      - ppt_get_planning_context
       - ppt_find_deck
       - ppt_prepare_style_choices
     inputs:
       - material: requirement_analysis
         required: true
       - material: material_summary
+        required: false
+      - material: source_bundle
         required: false
       - material: style_flow
         required: true
@@ -489,6 +528,13 @@ steps:
       {{style_selection}}
 
       {{runtime_instruction}}
+
+      Before writing a new full-deck outline, call ppt_get_planning_context
+      exactly once. Treat its source_document.presentation_contract and anchored
+      source_excerpt as authoritative. Preserve every explicit source requirement
+      in outline_markdown and retain every required source asset for the internal
+      image-binding stage. Incremental whole-slide insertion may skip this call
+      because it uses the existing deck bundle.
 
       ## Incremental whole-slide insertion
 
@@ -562,6 +608,7 @@ steps:
       Do NOT call batch-page-html or export here — HTML is generate_ppt.
       After success, stop.
     tools:
+      - ppt_get_planning_context
       - ppt_find_deck
       - ppt_read_page_outline
       - ppt_insert_outline_page
@@ -573,6 +620,8 @@ steps:
       - material: material_summary
         required: false
       - material: material_images
+        required: false
+      - material: source_bundle
         required: false
       - material: ppt_capability_requirements
         required: true
@@ -610,6 +659,10 @@ steps:
 
       {{runtime_instruction}}
 
+      First call ppt_get_planning_context exactly once. Use the resolved source
+      contract and asset manifest when writing prompts; do not rely on prompt
+      placeholders to carry artifact bodies.
+
       First call ppt_find_deck, then call ppt_publish_outline once with that
       deck_dir. For a new workflow it splits the current approved Markdown into
       aligned editable slide_outline items without generating internal JSON.
@@ -626,6 +679,7 @@ steps:
       Stop immediately after publishing. Do not call ppt_build_outline,
       ppt_generate_pages, page-html, or save_artifacts.
     tools:
+      - ppt_get_planning_context
       - ppt_find_deck
       - ppt_publish_outline
     inputs:
@@ -636,6 +690,8 @@ steps:
       - material: material_summary
         required: false
       - material: material_images
+        required: false
+      - material: source_bundle
         required: false
       - material: background_images
         required: false
@@ -678,6 +734,11 @@ steps:
       execution context and bound prior artifacts to retain the existing requirements.
 
       {{runtime_instruction}}
+
+      First call ppt_get_planning_context exactly once and use its bound
+      requirement_analysis, material_summary and source-document contract when
+      writing the background prompts. Do not infer missing inputs from empty
+      prompt placeholders.
 
       Prepare the deck before writing the prompts:
       - For a new auto task, call ppt_init_deck with the analyzed request, exact
@@ -724,6 +785,7 @@ steps:
       After ppt_publish_background_prompts succeeds, stop. This step does not
       require approval by default; the generated backgrounds step follows.
     tools:
+      - ppt_get_planning_context
       - ppt_init_deck
       - ppt_find_deck
       - ppt_prepare_style
@@ -733,6 +795,8 @@ steps:
       - material: requirement_analysis
         required: true
       - material: material_summary
+        required: false
+      - material: source_bundle
         required: false
       - material: style_flow
         required: true

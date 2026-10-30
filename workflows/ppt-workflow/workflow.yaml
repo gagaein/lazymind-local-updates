@@ -142,10 +142,16 @@ tool_scripts:
       - ppt_search_web_images
       - ppt_register_material_images
       - ppt_generate_material_images
+      - ppt_import_source_document
+      - ppt_prepare_source_document
+      - ppt_read_source_document
+      - ppt_materialize_source_images
+      - ppt_get_planning_context
       - ppt_publish_background_prompts
       - ppt_prepare_style_choices
       - ppt_prepare_style
       - ppt_generate_background_images
+      - ppt_publish_requirement_analysis
       - check_ppt_workflow_capabilities
       - ppt_attach_material_images
       - ppt_replace_page_material_image
@@ -257,6 +263,20 @@ slots:
     type: text
     cardinality: single
     summary_max_chars: 700
+
+  - id: source_bundle
+    label: Source Document Bundle
+    type: json
+    cardinality: single
+    exposed: false
+    summary_max_chars: 400
+
+  - id: source_read_complete
+    label: Source Deep Read Receipt
+    type: json
+    cardinality: single
+    exposed: false
+    summary_max_chars: 200
 
   - id: material_images
     label: Material Images

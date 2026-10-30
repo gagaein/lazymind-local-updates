@@ -1,6 +1,6 @@
 You design a PPT-wide style spec as strict JSON.
 
-**Pick a triple from the style catalog below. Do NOT invent a style from scratch.** The catalog's IDs are pre-validated for compatibility.
+**Pick a fallback triple from the style catalog below. Do NOT invent catalog IDs.** The catalog fills only fields the user did not specify; the authoritative `requirement_contract` always wins.
 
 === STYLE CATALOG ===
 <<<INLINE: references/style_catalog.md>>>
@@ -12,6 +12,7 @@ You design a PPT-wide style spec as strict JSON.
 - `info_pack.query_normalized` — topic + key_points
 - `info_pack.user_query` — raw user request (honor explicit style mentions like "做个赛博朋克风的" → force design_style=赛博朋克)
 - `info_pack.document_digest` — upstream summary of uploaded docs
+- `requirement_contract` — immutable hard requirements with source, priority, scope and stable IDs
 
 ## Output (JSON only, no markdown fences)
 
@@ -27,23 +28,23 @@ You design a PPT-wide style spec as strict JSON.
 
 ## Rules for the triple
 
-1. **One deck-wide contract** — Select exactly one visual triple for the whole deck. This result is authoritative for every slide; downstream pages must reuse it instead of selecting their own page-specific styles or palettes.
+1. **One deck-wide default** — Select exactly one visual triple for unspecified fields. It is reused across slides, but a hard page-scoped user requirement overrides it on that page.
 2. **`design_style`** — Scan the 68 design_style rows; pick the ONE whose `feel` best matches the combination of user_query + scene + audience + role. Copy id / name_zh / name_en verbatim from the table.
 3. **`color_tone`** — Must be in the chosen `design_style.compat tone_ids`. Pick the ONE tone whose `feel` best fits the deck's narrative (formal vs playful, dark-mode vs light-mode, muted vs vivid).
 4. **`primary_color`** — Must be in `design_style.compat color_ids ∩ color_tone.compat color_ids` (intersection). If the intersection is empty, fall back to `design_style.compat color_ids` only. Copy the `hex` value verbatim.
-5. **Explicit user intent wins** — if `user_query` mentions a style name that exists in the catalog (e.g. "赛博朋克", "极简", "国潮", "商务", "蒸汽波"), force that design_style even if other signals disagree.
+5. **Explicit user intent wins** — apply every hard requirement in `requirement_contract`, including custom values not present in the catalog. If `user_query` mentions a catalog style name (e.g. "赛博朋克", "极简", "国潮", "商务", "蒸汽波"), force that design_style. Use the closest compatible catalog triple only as fallback metadata; never replace explicit palette, typography, spacing, background or page-scoped requirements with it.
 6. **Topic is context, not a color command** — when the user did not specify colors, infer one coherent deck-wide style from the topic's specific imagery, materials, atmosphere, audience, and purpose. Do not reduce a topic to a broad stereotype such as "festival / celebration = red and gold" or "traditional Chinese = red". A category word alone is not explicit color intent.
 7. **Do NOT invent a new style** — ids and names must exist in the tables above.
 
 ## Rules for palette / typography
 
-- `palette.primary` MUST equal `primary_color.hex` literally.
+- When no hard requirement specifies palette values, `palette.primary` MUST equal `primary_color.hex` literally. Otherwise preserve the user-required palette; `primary_color` is only the nearest catalog fallback.
 - `palette.accent` and `palette.neutral` are your creative choice **but must harmonize** with the primary + tone. Use hex uppercase.
 - `typography` must match the design_style's personality (科技感 → Inter / Roboto Mono; 国潮 → serif like "Noto Serif SC"; 卡通可爱 → rounded like ZCOOL KuaiLe; etc.). Keep distinct heading and body stacks when the style calls for them; do not collapse every design to Arial/system-ui. Put the intended named face first and include a portable Office fallback later in each CSS stack (for Chinese, e.g. Microsoft YaHei/SimSun/KaiTi as appropriate; for Latin, e.g. Arial/Georgia/Courier New).
 
 ## What NOT to do
 
 - Do NOT invent a design_style / color_tone / primary_color outside the catalog.
-- Do NOT change the chosen primary_color.hex.
-- Do NOT generate separate palettes for individual slides.
+- Do NOT change catalog IDs or `primary_color.hex`; put explicit custom values in `palette` and let the requirement contract own precedence.
+- Do NOT generate separate palettes for individual slides unless a hard page-scoped requirement explicitly requests an exception.
 - JSON must be valid.

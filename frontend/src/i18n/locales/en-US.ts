@@ -3761,6 +3761,7 @@ const enUS = {
     workflowStatusPaused: "Paused",
     workflowStatusBlocked: "Waiting for inputs",
     workflowStatusWaiting: "Waiting for approval",
+    workflowStatusInterrupted: "Interrupted",
     workflowStatusFailed: "Failed",
     workflowStatusStopped: "Stopped",
     workflowBtnDisabledHint: "Step is running, please wait…",

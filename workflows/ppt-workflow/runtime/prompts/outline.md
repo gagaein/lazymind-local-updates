@@ -26,9 +26,10 @@ Output (JSON only):
       ],
       "visual_hints": "<30-120 chars: internal-only composition, hierarchy, imagery and mood guidance; never reader-visible>",
       "use_table": {"doc_index": 0, "table_index": 2} | null,
-      "use_image": {"doc_index": 0, "image_index": 0}
-                 | {"reference_image_index": 0}
-                 | null
+      "use_image": [
+        {"doc_index": 0, "image_index": 0},
+        {"reference_image_index": 0}
+      ]
     }
   ]
 }
@@ -57,11 +58,11 @@ All reader-visible text fields (`title`, `subtitle`, every `bullets[].head`/`det
 - `visual_hints`: internal-only composition guidance. Apply it downstream but never render the sentence or field label as visible copy.
 - `use_table` / `use_image` **inherit from the input's source material**. Two separate pools can feed `use_image`:
   * **Pool A — document-embedded images**: walk `document_digest.inherited_images` (or, if digest is null, `raw_documents_excerpt` entries with non-empty `inherited_images`). Each item is `{doc_index, image_index}`.
-  * **Pool B — standalone reference_images** (user uploads OR images registered in collect_materials from KB / web / explicit AI material generation): walk `available_reference_images`. Each item is referenced by its 0-based `reference_image_index`. Prefer the provided `caption` for topic matching; fall back to `basename` (e.g. `material_01.png`, `fig3_dram_market_share.png`). **Assign every Pool-B image to a relevant content/data page** so the final HTML embeds it as a foreground `<img>`.
+  * **Pool B — standalone reference_images** (source-document images, user uploads, or images registered in collect_materials from KB / web / explicit AI material generation): walk `available_reference_images`. Each item is referenced by its 0-based `reference_image_index`. Prefer the provided `caption` for topic matching; fall back to `basename` (e.g. `material_01.png`, `fig3_dram_market_share.png`). Items with `required=true` MUST be assigned to at least one relevant content/data page. Optional items may be omitted when they do not support a page.
   * Walk through `document_digest.inherited_tables` and assign each to the most relevant page (ideally a `data` page) via `use_table`.
-  * **Aim to use EVERY image across the deck** — if Pool A + Pool B together have 9 items and the deck has at least 9 pages, at least 9 pages should have `use_image` set (most likely via `reference_image_index`). Each image MUST be used at most once across the deck. Do not discard uploaded material just because digest was null.
-  * If there are MORE images than pages, pick the most impactful (those matching key_points; high-level diagrams / market share charts over low-information screenshots).
-  * `use_image` payload is EITHER `{"doc_index": D, "image_index": I}` (Pool A) OR `{"reference_image_index": N}` (Pool B). It is ONE object or null, NEVER an array/list. Never put two images on one page through `use_image`, never mix fields, and never invent indices outside the pool bounds.
+  * Preserve source-specified order and reuse. A required source image may be reused across pages when the source contract calls for it.
+  * If there are more required images than pages, bind multiple images to the relevant page instead of dropping them.
+  * `use_image` is always an ordered JSON array. Each item is EITHER `{"doc_index": D, "image_index": I}` (Pool A) OR `{"reference_image_index": N}` (Pool B). Use `[]` when no image is needed. Never mix fields within one item or invent indices outside the pool bounds.
   * Naming an image such as `material_03` only inside `visual_hints`, `narrative`, or a bullet does NOT bind that image. You MUST also set the page's structured `use_image` field to the matching `reference_image_index`.
 - Inherit domain facts from `document_digest` faithfully — do NOT invent metrics. If no digest is available, lean on `query_normalized.key_points` + general knowledge around the topic.
 - Do **not** invent decorative AI image slots. Slide visuals are CSS / SVG / ECharts and/or Pool A/B `use_image` only.
@@ -73,4 +74,4 @@ Explicit user requirements and source fidelity take priority over brevity. Retai
 
 ## Machine-readable output contract
 
-Return exactly one complete JSON object, with double-quoted keys/strings, no trailing commas, no commentary, and no Markdown fences. `pages` must be an array of exactly the requested length, in display order. Each page needs a non-empty `title` and integer `page_no` starting at 1. `bullets` is an array of `{ "head": "...", "detail": "..." }` objects (or `[]`); optional prose fields are strings (use `""` when absent). Keep `use_image` as a single object or null, never an array. Finish the JSON before ending the response. Do not return a success message in place of the object.
+Return exactly one complete JSON object, with double-quoted keys/strings, no trailing commas, no commentary, and no Markdown fences. `pages` must be an array of exactly the requested length, in display order. Each page needs a non-empty `title` and integer `page_no` starting at 1. `bullets` is an array of `{ "head": "...", "detail": "..." }` objects (or `[]`); optional prose fields are strings (use `""` when absent). Keep `use_image` as an ordered array. Finish the JSON before ending the response. Do not return a success message in place of the object.
