@@ -1,0 +1,1184 @@
+import inspect
+import json
+from unittest.mock import MagicMock, patch
+
+import lazyllm
+import pytest
+from lazyllm.tools.agent.toolsManager import ModuleTool
+
+from lazymind.chat.workflow.workflow_manager import (
+    enforce_startup_clarification_policy,
+    resolve_workflow_injection,
+    workflow_startup_clarification_already_asked,
+)
+from lazymind.workflow_sdk import WorkflowClientError
+
+
+@pytest.fixture(autouse=True)
+def workflow_enabled():
+    previous = lazyllm.globals.get('agentic_config')
+    lazyllm.globals['agentic_config'] = {'enable_workflow': True}
+    yield
+    if previous is None:
+        lazyllm.globals.pop('agentic_config', None)
+    else:
+        lazyllm.globals['agentic_config'] = previous
+
+
+def _tool(contribution, name):
+    pending = list(contribution.tools)
+    while pending:
+        tool = pending.pop(0)
+        if isinstance(tool, dict):
+            pending.extend(tool.get('tools') or [])
+        elif tool.__name__ == name:
+            return tool
+    raise StopIteration(name)
+
+
+def test_chat_workflow_client_binds_host_history_not_model_fields():
+    from lazymind.chat.workflow.workflow_manager import _client
+
+    lazyllm.globals['agentic_config'] = {
+        'user_id': 'owner', '_workspace_execution': {'history_id': 'foreground-turn', 'run_id': 'run'},
+    }
+    with patch('lazymind.chat.workflow.workflow_manager.WorkflowClient') as client:
+        _client()
+    assert client.call_args.kwargs['trigger_history_id'] == 'foreground-turn'
+
+
+def _tool_names(contribution):
+    names = set()
+    pending = list(contribution.tools)
+    while pending:
+        tool = pending.pop(0)
+        if isinstance(tool, dict):
+            names.add(str(tool.get('name') or ''))
+            pending.extend(tool.get('tools') or [])
+        else:
+            names.add(tool.__name__)
+    return names
+
+
+@pytest.mark.parametrize('workflow_id', [
+    'writer-workflow', 'image-workflow', 'ppt-workflow', 'product_solution_delivery',
+])
+def test_manager_never_injects_domain_navigation_tools(workflow_id):
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory:
+        client_factory.return_value.get_state.return_value = {
+            'session_id': 'session-1', 'status': 'active', 'state_version': 3,
+        }
+        contribution = resolve_workflow_injection({'session_id': 'session-1', 'workflow_id': workflow_id})
+    product_tools = {'get_product_stage_options', 'read_product_project_artifact', 'relay_product_stage'}
+    names = _tool_names(contribution)
+    assert names & product_tools == set()
+
+
+def test_mentioned_workflow_is_injected_as_authoritative_selection():
+    catalog = [{
+        'workflow_ref': 'builtin:image-workflow',
+        'workflow_id': 'image-workflow',
+        'revision_id': 'revision-1',
+        'name': 'AI image generation',
+    }]
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.httpx.get',
+    ) as http_get:
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+        }
+        contribution = resolve_workflow_injection(
+            None,
+            current_query='run it now',
+            workflow_catalog=catalog,
+            allowed_workflow_refs=['builtin:image-workflow'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow',
+                'revision_id': 'revision-1',
+                'tool_name': 'trigger_image_workflow',
+                'tool_description': "Load the exact 'AI image generation' Workflow",
+                'prompt': 'Call the bound trigger; do not call list_workflows.',
+            }],
+        )
+    client_factory.return_value.get_workflow.assert_called_once_with('image-workflow', 'revision-1')
+    http_get.assert_not_called()
+
+    assert 'builtin:image-workflow' in contribution.runtime_context
+    assert 'revision-1' in contribution.runtime_context
+    assert '"current_query": "run it now"' in contribution.runtime_context
+    assert list(inspect.signature(
+        _tool(contribution, 'trigger_image_workflow'),
+    ).parameters) == ['request_context']
+    assert 'prepare_workflow' not in _tool_names(contribution)
+    assert 'list_workflow_attachments' not in _tool_names(contribution)
+    assert 'bind_workflow_input' not in _tool_names(contribution)
+
+
+@pytest.mark.parametrize('json_encoded', [False, True])
+def test_dynamic_trigger_loads_pinned_remote_package_without_listing(json_encoded):
+    lazyllm.globals['agentic_config']['files'] = ['/safe/report.pdf']
+    toolkit = MagicMock()
+    toolkit.prepare_workflow.return_value = {
+        'session_id': 'session-1', 'state_version': 1, 'ready_steps': ['prompt'],
+    }
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit', return_value=toolkit,
+    ), patch('lazymind.chat.workflow.workflow_manager._resolve_workflow_attachment', return_value=(
+        '/safe/report.pdf', None,
+    )), patch('lazymind.chat.workflow.workflow_manager._import_attachment', return_value={
+        'resource_id': 'resource-1', 'revision': 1, 'content_hash': 'sha256:test',
+    }):
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+        }
+        client_factory.return_value.get_state.return_value = {
+            'session_id': 'session-1', 'state_version': 1,
+            'projection': {'reachable': ['prompt'], 'ready': ['prompt'], 'blocked': []},
+        }
+        contribution = resolve_workflow_injection(
+            None,
+            current_query='original workflow request',
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow',
+                'revision_id': 'revision-1',
+                'name': 'AI image generation',
+            }],
+            allowed_workflow_refs=['builtin:image-workflow'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow',
+                'revision_id': 'revision-1',
+                'tool_name': 'trigger_image_workflow',
+                'tool_description': 'Load selected workflow',
+                'prompt': 'Call the bound trigger; do not call list_workflows.',
+            }],
+        )
+
+        trigger = _tool(contribution, 'trigger_image_workflow')
+        bindings = {'source': 'report.pdf'}
+        tool = ModuleTool(apply_func=trigger, schema_func=trigger)
+        arguments = tool._validate_input({'input_bindings': json.dumps(bindings) if json_encoded else bindings})
+        result = trigger(**arguments)
+
+    client_factory.return_value.list_workflows.assert_not_called()
+    client_factory.return_value.get_workflow.assert_called_once_with(
+        'image-workflow', 'revision-1',
+    )
+    assert result['status'] == 'prepared'
+    assert result['outcome'] == 'ready'
+    assert result['request_context'] == 'original workflow request'
+    assert result['revision_id'] == 'revision-1'
+    assert result['reachable_steps'] == ['prompt']
+    assert result['ready_steps'] == ['prompt']
+    toolkit.prepare_workflow.assert_called_once_with(
+        'image-workflow', input_bindings={
+            'source': {'resource_id': 'resource-1', 'revision': 1,
+                       'content_hash': 'sha256:test'},
+        }, request_context='original workflow request', workflow_mode='dynamic',
+    )
+    toolkit.advance_step.assert_not_called()
+
+
+@pytest.mark.parametrize('json_encoded', [False, True])
+def test_dynamic_trigger_imports_scalar_binding_without_conversation_attachments(json_encoded):
+    toolkit = MagicMock()
+    toolkit.prepare_workflow.return_value = {
+        'session_id': 'session-1', 'state_version': 1, 'ready_steps': ['draft'],
+    }
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit', return_value=toolkit,
+    ), patch('lazymind.chat.workflow.workflow_manager._import_text_binding', return_value={
+        'resource_id': 'text-resource', 'revision': 1, 'content_hash': 'sha256:text',
+    }) as import_text:
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'report', 'revision_id': 'revision-1',
+            'compiled_graph': {
+                'material_types': {'target_length': 'text'},
+                'material_producers': {'target_length': {'kind': 'external'}},
+            },
+        }
+        client_factory.return_value.get_state.return_value = {
+            'session_id': 'session-1', 'state_version': 1,
+            'projection': {'reachable': ['draft'], 'ready': ['draft'], 'blocked': []},
+        }
+        contribution = resolve_workflow_injection(
+            None, current_query='write about 3000 words',
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:report', 'workflow_id': 'report',
+                'revision_id': 'revision-1',
+            }],
+            allowed_workflow_refs=['builtin:report'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:report', 'workflow_id': 'report',
+                'revision_id': 'revision-1', 'tool_name': 'trigger_report_workflow',
+            }],
+        )
+
+        trigger = _tool(contribution, 'trigger_report_workflow')
+        bindings = {'target_length': '3000'}
+        tool = ModuleTool(apply_func=trigger, schema_func=trigger)
+        arguments = tool._validate_input({'input_bindings': json.dumps(bindings) if json_encoded else bindings})
+        result = trigger(**arguments)
+
+    import_text.assert_called_once_with('target_length', '3000')
+    assert result['session_id'] == 'session-1'
+    toolkit.prepare_workflow.assert_called_once_with(
+        'report', input_bindings={
+            'target_length': {
+                'resource_id': 'text-resource', 'revision': 1,
+                'content_hash': 'sha256:text',
+            },
+        }, request_context='write about 3000 words', workflow_mode='dynamic',
+    )
+
+
+@pytest.mark.parametrize('bindings', [
+    '{bad json', '[]', 'null', '"text"', '{"target_length":300}',
+    '{"target_length":{"data":"300"}}', '{"unexposed":"300"}',
+])
+def test_trigger_rejects_invalid_json_bindings_before_import_or_preparation(bindings):
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit',
+    ) as toolkit, patch('lazymind.chat.workflow.workflow_manager._import_text_binding') as import_text:
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'report', 'revision_id': 'revision-1',
+            'runtime': {'trigger_inputs': ['target_length']},
+            'compiled_graph': {
+                'material_types': {'target_length': 'text'},
+                'material_producers': {'target_length': {'kind': 'external'}},
+            },
+        }
+        contribution = resolve_workflow_injection(
+            None, current_query='write about 300 words',
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:report', 'workflow_id': 'report', 'revision_id': 'revision-1',
+            }],
+            allowed_workflow_refs=['builtin:report'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:report', 'workflow_id': 'report',
+                'revision_id': 'revision-1', 'tool_name': 'trigger_report_workflow',
+            }],
+        )
+        trigger = _tool(contribution, 'trigger_report_workflow')
+        tool = ModuleTool(apply_func=trigger, schema_func=trigger)
+        arguments = tool._validate_input({'input_bindings': bindings})
+
+        with pytest.raises(WorkflowClientError):
+            trigger(**arguments)
+
+    import_text.assert_not_called()
+    toolkit.return_value.prepare_workflow.assert_not_called()
+
+
+@pytest.mark.parametrize('json_encoded', [False, True])
+@pytest.mark.parametrize('has_required_input', [False, True])
+def test_trigger_omits_blank_bindings_and_preserves_runtime_missing_inputs(json_encoded, has_required_input):
+    toolkit = MagicMock()
+    toolkit.prepare_workflow.return_value = (
+        {'session_id': 'session-1', 'ready_steps': ['draft']}
+        if has_required_input else {'status': 'needs_input', 'missing_inputs': ['topic']}
+    )
+    bindings = {'topic': '社区自习室' if has_required_input else ' ',
+                'target_length': '', 'source': '  ', 'reference': '\n', 'preferences': '\t'}
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit', return_value=toolkit,
+    ), patch('lazymind.chat.workflow.workflow_manager._import_text_binding', return_value={
+        'resource_id': 'topic-resource', 'revision': 1, 'content_hash': 'sha256:topic',
+    }) as import_text, patch(
+        'lazymind.chat.workflow.workflow_manager._resolve_workflow_attachment',
+    ) as resolve_attachment:
+        client = client_factory.return_value
+        client.get_workflow.return_value.result = {
+            'workflow_id': 'report', 'revision_id': 'revision-1',
+            'runtime': {'trigger_inputs': list(bindings)},
+            'compiled_graph': {
+                'material_types': {'topic': 'text', 'target_length': 'text', 'source': 'file',
+                                   'reference': 'image', 'preferences': 'json'},
+                'material_producers': {key: {'kind': 'external'} for key in bindings},
+            },
+        }
+        client.get_state.return_value = {
+            'session_id': 'session-1', 'projection': {'ready': ['draft']},
+        }
+        contribution = resolve_workflow_injection(
+            None, current_query='设计社区自习室预约产品，只做产品方向，使用默认结构',
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:report', 'workflow_id': 'report', 'revision_id': 'revision-1',
+            }],
+            allowed_workflow_refs=['builtin:report'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:report', 'workflow_id': 'report',
+                'revision_id': 'revision-1', 'tool_name': 'trigger_report_workflow',
+            }],
+        )
+        trigger = _tool(contribution, 'trigger_report_workflow')
+        tool = ModuleTool(apply_func=trigger, schema_func=trigger)
+        arguments = tool._validate_input({'input_bindings': json.dumps(bindings) if json_encoded else bindings})
+
+        result = trigger(**arguments)
+
+    expected = {'topic': import_text.return_value} if has_required_input else {}
+    assert toolkit.prepare_workflow.call_args.kwargs['input_bindings'] == expected
+    resolve_attachment.assert_not_called()
+    if has_required_input:
+        import_text.assert_called_once_with('topic', '社区自习室')
+        assert result['session_id'] == 'session-1'
+        assert result['outcome'] == 'ready'
+    else:
+        import_text.assert_not_called()
+        client.get_state.assert_not_called()
+        assert result['outcome'] == 'waiting_for_input'
+        assert result['missing_inputs'] == ['topic']
+        assert 'session_id' not in result
+    toolkit.advance_step.assert_not_called()
+
+
+def test_selected_workflow_declares_missing_only_startup_clarification():
+    runtime = {
+        'clarification_fields': [
+            {'id': 'topic', 'label': '主题', 'question': '主题是什么？', 'type': 'text'},
+            {'id': 'slide_count', 'label': '页数', 'question': '生成多少页？',
+             'type': 'single', 'choices': ['3 页', '5 页'], 'allow_other': False},
+        ],
+    }
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.httpx.get',
+    ) as http_get:
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'ppt-workflow', 'revision_id': 'revision-1', 'runtime': runtime,
+        }
+        contribution = resolve_workflow_injection(
+            None,
+            current_query='给协和医院做一份科技风 PPT',
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:ppt-workflow',
+                'workflow_id': 'ppt-workflow',
+                'revision_id': 'revision-1',
+                'runtime': runtime,
+            }],
+            allowed_workflow_refs=['builtin:ppt-workflow'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:ppt-workflow',
+                'workflow_id': 'ppt-workflow',
+                'revision_id': 'revision-1',
+                'tool_name': 'trigger_ppt_workflow',
+            }],
+        )
+    client_factory.return_value.get_workflow.assert_called_once_with('ppt-workflow', 'revision-1')
+    http_get.assert_not_called()
+
+    assert contribution.runtime_policy == runtime
+    assert 'startup_clarification_fields' in contribution.runtime_context
+    assert '主题是什么？' in contribution.runtime_context
+    assert '生成多少页？' in contribution.runtime_context
+    assert '"allow_other": false' in contribution.runtime_context
+
+
+def test_fixed_startup_choice_policy_overrides_model_other_option():
+    runtime = {
+        'clarification_fields': [{
+            'id': 'generate_background_images',
+            'question': '是否为每一页启用 AI 生成底图？',
+            'type': 'single',
+            'choice_policy': 'fixed',
+            'choices': ['启用｜为每页生成独立 AI 底图', '不启用｜使用纯色、渐变和矢量装饰'],
+        }],
+    }
+
+    questions = enforce_startup_clarification_policy([{
+        'id': 'generate_background_images',
+        'text': '是否为这份 PPT 启用 AI 底图？',
+        'type': 'single',
+        'choices': ['启用', '不启用', '其他'],
+    }], runtime)
+
+    assert questions == [{
+        'id': 'generate_background_images',
+        'text': '是否为这份 PPT 启用 AI 底图？',
+        'type': 'single',
+        'choices': ['启用｜为每页生成独立 AI 底图', '不启用｜使用纯色、渐变和矢量装饰'],
+        'allow_other': False,
+    }]
+
+
+def test_seed_startup_choice_policy_remains_open_ended():
+    questions = [{
+        'id': 'slide_count',
+        'text': '希望生成多少页？',
+        'type': 'single',
+        'choices': ['3 页', '5 页'],
+    }]
+    runtime = {
+        'clarification_fields': [{
+            **questions[0],
+            'choice_policy': 'seed',
+        }],
+    }
+
+    assert enforce_startup_clarification_policy(questions, runtime) == questions
+
+
+def test_startup_clarification_is_single_shot_and_default_trigger_merges_context():
+    runtime = {
+        'clarification_fields': [
+            {'id': 'topic', 'question': '主题是什么？', 'type': 'text'},
+            {'id': 'target_customer', 'question': '面向哪类客户？', 'type': 'text'},
+        ],
+    }
+    history = [
+        {'role': 'user', 'content': '根据知识库生成两页企业招标准则 PPT'},
+        {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [{
+                'id': 'ask-1',
+                'type': 'function',
+                'function': {
+                    'name': 'ask_user',
+                    'arguments': '{"questions":[{"id":"target_customer",'
+                                 '"text":"面向哪类客户？","type":"single",'
+                                 '"choices":["公司负责人","采购部门"]}]}',
+                },
+            }],
+        },
+        {'role': 'tool', 'name': 'ask_user', 'tool_call_id': 'ask-1',
+         'content': 'The user submitted the form.'},
+    ]
+    assert workflow_startup_clarification_already_asked(history, runtime)
+
+    toolkit = MagicMock()
+    toolkit.prepare_workflow.return_value = {
+        'session_id': 'session-1', 'state_version': 1,
+        'ready_steps': ['analyze_requirements'],
+    }
+    toolkit.get_ready_steps.return_value = {
+        'session_id': 'session-1', 'state_version': 1,
+        'ready_steps': ['analyze_requirements'],
+        'retryable_steps': [], 'rewindable_steps': [],
+    }
+    toolkit.advance_step.return_value = {'status': 'succeeded'}
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit', return_value=toolkit,
+    ):
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'ppt-workflow', 'revision_id': 'revision-1',
+        }
+        client_factory.return_value.get_state.return_value = {
+            'session_id': 'session-1', 'state_version': 1,
+            'projection': {'ready': ['analyze_requirements']},
+        }
+        contribution = resolve_workflow_injection(
+            None,
+            current_query='面向哪类客户？: 公司负责人',
+            conversation_history=history,
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:ppt-workflow',
+                'workflow_id': 'ppt-workflow',
+                'revision_id': 'revision-1',
+                'runtime': runtime,
+            }],
+            allowed_workflow_refs=['builtin:ppt-workflow'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:ppt-workflow',
+                'workflow_id': 'ppt-workflow',
+                'revision_id': 'revision-1',
+                'tool_name': 'trigger_ppt_workflow',
+            }],
+        )
+        # Even if the model supplies only this turn's answer, Host preserves
+        # the original request and all of its already-known fields.
+        result = _tool(contribution, 'trigger_ppt_workflow')(
+            request_context='面向哪类客户？: 公司负责人',
+        )
+        _tool(contribution, 'advance_step')(['analyze_requirements'])
+
+    assert '根据知识库生成两页企业招标准则 PPT' in result['request_context']
+    assert '面向哪类客户？: 公司负责人' in result['request_context']
+    toolkit.prepare_workflow.assert_called_once_with(
+        'ppt-workflow', input_bindings={}, request_context=result['request_context'],
+        workflow_mode='dynamic',
+    )
+    command = toolkit.advance_step.call_args.args[2][0]
+    assert command.user_input == result['request_context']
+
+
+def test_completed_historical_clarification_does_not_block_a_new_workflow_request():
+    runtime = {'clarification_fields': [{
+        'id': 'topic', 'question': '这份 PPT 的主题是什么？', 'type': 'text',
+    }]}
+    history = [
+        {'role': 'user', 'content': '做一个 PPT'},
+        {
+            'role': 'assistant',
+            'tool_calls': [{
+                'id': 'ask-old',
+                'type': 'function',
+                'function': {
+                    'name': 'ask_user',
+                    'arguments': json.dumps({'questions': [{
+                        'id': 'topic', 'text': '这份 PPT 的主题是什么？', 'type': 'text',
+                    }]}, ensure_ascii=False),
+                },
+            }],
+        },
+        {'role': 'tool', 'name': 'ask_user', 'tool_call_id': 'ask-old', 'content': '产品介绍'},
+        {'role': 'assistant', 'content': 'PPT 已生成完成。'},
+        {'role': 'user', 'content': '再做一份 PPT'},
+    ]
+
+    assert not workflow_startup_clarification_already_asked(history, runtime)
+
+
+def test_interrupted_historical_clarification_does_not_block_a_new_request():
+    runtime = {'clarification_fields': [{
+        'id': 'generate_background_images',
+        'question': '是否启用 AI 底图？',
+        'type': 'single',
+        'choices': ['启用', '不启用'],
+    }]}
+    history = [
+        {'role': 'user', 'content': '做一个春节 PPT'},
+        {
+            'role': 'assistant',
+            'tool_calls': [{
+                'id': 'ask-interrupted',
+                'type': 'function',
+                'function': {
+                    'name': 'ask_user',
+                    'arguments': json.dumps({'questions': [{
+                        'id': 'generate_background_images',
+                        'text': '是否启用 AI 底图？',
+                        'type': 'single',
+                        'choices': ['启用', '不启用'],
+                    }]}, ensure_ascii=False),
+                },
+            }],
+        },
+        {'role': 'tool', 'name': 'ask_user', 'tool_call_id': 'ask-interrupted',
+         'content': 'The user submitted the form.'},
+        {'role': 'user', 'content': '不启用'},
+        # The workflow crashed here, before an assistant completion was saved.
+    ]
+
+    assert not workflow_startup_clarification_already_asked(
+        history,
+        runtime,
+        current_query='重新做一个春节 PPT',
+    )
+    assert workflow_startup_clarification_already_asked(
+        history,
+        runtime,
+        current_query='不启用',
+    )
+
+
+def test_clarification_answer_turn_can_pass_merged_request_context_to_trigger():
+    toolkit = MagicMock()
+    toolkit.prepare_workflow.return_value = {
+        'session_id': 'session-1', 'state_version': 1,
+        'ready_steps': ['analyze_requirements'],
+    }
+    merged = (
+        '原始需求：制作医院智算应用技术方案。'
+        '补充：8页；客户是协和医院；科技未来风格。'
+    )
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit', return_value=toolkit,
+    ):
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'ppt-workflow', 'revision_id': 'revision-1',
+        }
+        client_factory.return_value.get_state.return_value = {
+            'session_id': 'session-1', 'state_version': 1,
+            'projection': {'ready': ['analyze_requirements']},
+        }
+        contribution = resolve_workflow_injection(
+            None,
+            current_query='8页，协和医院，科技未来风格',
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:ppt-workflow',
+                'workflow_id': 'ppt-workflow',
+                'revision_id': 'revision-1',
+            }],
+            allowed_workflow_refs=['builtin:ppt-workflow'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:ppt-workflow',
+                'workflow_id': 'ppt-workflow',
+                'revision_id': 'revision-1',
+                'tool_name': 'trigger_ppt_workflow',
+            }],
+        )
+
+        result = _tool(contribution, 'trigger_ppt_workflow')(request_context=merged)
+
+    assert result['request_context'] == merged
+    toolkit.prepare_workflow.assert_called_once_with(
+        'ppt-workflow', input_bindings={}, request_context=merged, workflow_mode='dynamic',
+    )
+
+
+def test_dynamic_trigger_activates_advance_step_in_the_same_agent_turn():
+    toolkit = MagicMock()
+    toolkit.prepare_workflow.return_value = {
+        'session_id': 'session-1', 'state_version': 1, 'ready_steps': ['prompt'],
+    }
+    toolkit.get_ready_steps.return_value = {
+        'session_id': 'session-1', 'state_version': 1,
+        'ready_steps': ['prompt'], 'retryable_steps': [], 'rewindable_steps': [],
+    }
+    toolkit.advance_step.return_value = {'status': 'succeeded'}
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit', return_value=toolkit,
+    ):
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+        }
+        client_factory.return_value.get_state.return_value = {
+            'session_id': 'session-1', 'state_version': 1,
+            'projection': {'reachable': ['prompt'], 'ready': ['prompt']},
+        }
+        contribution = resolve_workflow_injection(
+            {'workflow_mode': 'dynamic'},
+            current_query='run it', conversation_id='conversation-1',
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+            }],
+            allowed_workflow_refs=['builtin:image-workflow'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+                'tool_name': 'trigger_image_workflow',
+            }],
+        )
+
+        assert 'advance_step' in _tool_names(contribution)
+        assert 'advance_step_and_hand_off' in _tool_names(contribution)
+        assert contribution.stop_tools == []
+        _tool(contribution, 'trigger_image_workflow')()
+        result = _tool(contribution, 'advance_step')(['prompt'])
+
+    assert result == {'status': 'succeeded'}
+    assert toolkit.advance_step.call_args.args[0] == 'session-1'
+    assert toolkit.advance_step.call_args.args[1] == 1
+
+
+def test_selected_workflow_session_tool_auto_initializes_without_attachments():
+    toolkit = MagicMock()
+    toolkit.prepare_workflow.return_value = {
+        'session_id': 'session-1', 'state_version': 1,
+        'ready_steps': ['analyze_requirements'],
+    }
+    toolkit.get_ready_steps.return_value = {
+        'session_id': 'session-1', 'state_version': 1,
+        'ready_steps': ['analyze_requirements'],
+        'retryable_steps': [], 'rewindable_steps': [],
+    }
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit', return_value=toolkit,
+    ):
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'ppt-workflow', 'revision_id': 'revision-1',
+        }
+        client_factory.return_value.get_state.return_value = {
+            'session_id': 'session-1', 'state_version': 1,
+            'projection': {
+                'reachable': ['analyze_requirements'],
+                'ready': ['analyze_requirements'],
+            },
+        }
+        contribution = resolve_workflow_injection(
+            None,
+            current_query='生成三页关于加减法数学题的PPT',
+            conversation_id='conversation-1',
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:ppt-workflow',
+                'workflow_id': 'ppt-workflow',
+                'revision_id': 'revision-1',
+            }],
+            allowed_workflow_refs=['builtin:ppt-workflow'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:ppt-workflow',
+                'workflow_id': 'ppt-workflow',
+                'revision_id': 'revision-1',
+                'tool_name': 'trigger_ppt_workflow',
+            }],
+        )
+
+        result = _tool(contribution, 'get_ready_steps')()
+        repeated_trigger = _tool(contribution, 'trigger_ppt_workflow')()
+
+    assert result['ready_steps'] == ['analyze_requirements']
+    assert repeated_trigger['outcome'] == 'already_initialized'
+    assert repeated_trigger['session_id'] == 'session-1'
+    toolkit.prepare_workflow.assert_called_once_with(
+        'ppt-workflow', input_bindings={},
+        request_context='生成三页关于加减法数学题的PPT',
+        workflow_mode='dynamic',
+    )
+
+
+def test_dynamic_trigger_exposes_handoff_after_session_is_created_in_same_turn():
+    toolkit = MagicMock()
+    toolkit.prepare_workflow.return_value = {
+        'session_id': 'session-1', 'state_version': 1, 'ready_steps': ['prompt'],
+    }
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit', return_value=toolkit,
+    ):
+        client = client_factory.return_value
+        client.get_workflow.return_value.result = {
+            'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+        }
+        client.get_state.return_value = {
+            'session_id': 'session-1', 'state_version': 1,
+            'projection': {'reachable': ['prompt'], 'ready': ['prompt']},
+        }
+        client.get_ready_steps.return_value = {
+            'session_id': 'session-1', 'state_version': 1,
+            'ready_steps': ['review'], 'retryable_steps': [], 'rewindable_steps': [],
+        }
+        client.advance.return_value.result = {'status': 'queued'}
+        contribution = resolve_workflow_injection(
+            {'workflow_mode': 'dynamic'},
+            current_query='run it', conversation_id='conversation-1',
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+            }],
+            allowed_workflow_refs=['builtin:image-workflow'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+                'tool_name': 'trigger_image_workflow',
+            }],
+        )
+
+        _tool(contribution, 'trigger_image_workflow')()
+        result = _tool(contribution, 'advance_step_and_hand_off')('review')
+
+    assert result == '{"status": "queued"}'
+    request = client.advance.call_args.args[0]
+    assert request.session_id == 'session-1'
+    assert request.handoff is True
+    assert request.steps[0].step_id == 'review'
+    assert request.steps[0].user_input == 'run it'
+
+
+def test_active_workflow_forwards_current_edit_request_and_focus_to_step():
+    toolkit = MagicMock()
+    toolkit.get_ready_steps.return_value = {
+        'session_id': 'session-1', 'state_version': 7,
+        'ready_steps': [], 'retryable_steps': [], 'rewindable_steps': ['generate_ppt'],
+    }
+    toolkit.advance_step.return_value = {'status': 'succeeded'}
+    with patch('lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit',
+               return_value=toolkit), patch(
+        'lazymind.chat.workflow.workflow_manager._client',
+    ) as client_factory:
+        client_factory.return_value.get_state.return_value = {
+            'status': 'completed', 'state_version': 7,
+            'projection': {
+                'completed': True,
+                'rewindable': ['generate_ppt'],
+            },
+        }
+        contribution = resolve_workflow_injection(
+            {
+                'session_id': 'session-1',
+                'workflow_id': 'deck-workflow',
+                'focused_tab': 'composite_preview',
+                'focused_sort_order': 2,
+            },
+            conversation_id='conversation-1',
+            current_query='把这一页标题改成期末练习',
+            workflow_catalog=[
+                {
+                    'workflow_ref': 'builtin:writer-workflow',
+                    'workflow_id': 'writer-workflow',
+                    'runtime': {'completed_edit_step': 'draft'},
+                },
+                {
+                    'workflow_ref': 'builtin:deck-workflow',
+                    'workflow_id': 'deck-workflow',
+                    'runtime': {
+                        'completed_edit_step': 'generate_ppt',
+                        'completed_edit_routing': (
+                            'For whole-slide insertions, rewind to build_outline.'
+                        ),
+                    },
+                },
+            ],
+            allowed_workflow_refs=[
+                'builtin:writer-workflow', 'builtin:deck-workflow',
+            ],
+        )
+        # resolve_workflow_injection's patch is applied to agentic_config by ChatService.
+        lazyllm.globals['agentic_config'].update(contribution.agentic_config_patch)
+        result = _tool(contribution, 'advance_step')(['generate_ppt'])
+
+    assert result == {'status': 'succeeded'}
+    command = toolkit.advance_step.call_args.args[2][0]
+    assert command.user_input == '把这一页标题改成期末练习'
+    assert 'sort order 2' in command.runtime_instruction
+
+
+def test_manager_preserves_continue_for_all_workflows():
+    toolkit = MagicMock()
+    toolkit.get_ready_steps.return_value = {
+        'session_id': 'session-1', 'state_version': 7,
+        'ready_steps': ['analyze_requirements'],
+        'retryable_steps': [], 'rewindable_steps': [], 'continue_steps': [],
+    }
+    toolkit.advance_step.return_value = {'status': 'succeeded'}
+    with patch('lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit',
+               return_value=toolkit), patch(
+        'lazymind.chat.workflow.workflow_manager._client',
+    ) as client_factory:
+        client_factory.return_value.get_state.return_value = {
+            'status': 'waiting', 'state_version': 7,
+            'projection': {'ready': ['analyze_requirements']},
+        }
+        ppt = resolve_workflow_injection(
+            {'session_id': 'session-1', 'workflow_id': 'ppt-workflow'},
+            conversation_id='conversation-1', current_query='继续',
+        )
+        lazyllm.globals['agentic_config'].update(ppt.agentic_config_patch)
+        _tool(ppt, 'advance_step')(['analyze_requirements'])
+
+        writer = resolve_workflow_injection(
+            {'session_id': 'session-1', 'workflow_id': 'writer'},
+            conversation_id='conversation-1', current_query='继续',
+        )
+        lazyllm.globals['agentic_config'].update(writer.agentic_config_patch)
+        _tool(writer, 'advance_step')(['analyze_requirements'])
+
+    assert toolkit.advance_step.call_args_list[0].args[2][0].user_input == '继续'
+    assert toolkit.advance_step.call_args_list[1].args[2][0].user_input == '继续'
+
+
+def test_dynamic_trigger_defaults_request_context_to_current_query():
+    toolkit = MagicMock()
+    toolkit.prepare_workflow.return_value = {
+        'session_id': 'session-1', 'state_version': 1, 'ready_steps': ['prompt'],
+    }
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit', return_value=toolkit,
+    ):
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+        }
+        client_factory.return_value.get_state.return_value = {
+            'session_id': 'session-1', 'state_version': 1,
+            'projection': {'reachable': ['prompt'], 'ready': ['prompt']},
+        }
+        contribution = resolve_workflow_injection(
+            None,
+            current_query='run the selected workflow',
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow',
+                'revision_id': 'revision-1',
+            }],
+            allowed_workflow_refs=['builtin:image-workflow'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow',
+                'revision_id': 'revision-1',
+                'tool_name': 'trigger_image_workflow',
+            }],
+        )
+
+        result = _tool(contribution, 'trigger_image_workflow')()
+
+    assert result['request_context'] == 'run the selected workflow'
+    toolkit.advance_step.assert_not_called()
+
+
+def test_dynamic_trigger_preserves_exact_query_instead_of_model_paraphrase():
+    toolkit = MagicMock()
+    toolkit.prepare_workflow.return_value = {
+        'session_id': 'session-1', 'state_version': 1,
+        'ready_steps': ['analyze_subject'],
+    }
+    original = '搜索一张哈兰德的照片，然后给他球衣画上必胜两个字'
+    paraphrase = '生成一张哈兰德在球场上的写实照片，球衣印有必胜'
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit', return_value=toolkit,
+    ):
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+        }
+        client_factory.return_value.get_state.return_value = {
+            'session_id': 'session-1', 'state_version': 1,
+            'projection': {'reachable': ['analyze_subject'], 'ready': ['analyze_subject']},
+        }
+        contribution = resolve_workflow_injection(
+            None,
+            current_query=original,
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow',
+                'revision_id': 'revision-1',
+            }],
+            allowed_workflow_refs=['builtin:image-workflow'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow',
+                'revision_id': 'revision-1',
+                'tool_name': 'trigger_image_workflow',
+            }],
+        )
+
+        result = _tool(contribution, 'trigger_image_workflow')(
+            request_context=paraphrase,
+        )
+
+    assert result['request_context'] == original
+    toolkit.prepare_workflow.assert_called_once_with(
+        'image-workflow', input_bindings={}, request_context=original,
+        workflow_mode='dynamic',
+    )
+
+
+def test_dynamic_trigger_returns_waiting_without_advancing_when_no_step_is_ready():
+    toolkit = MagicMock()
+    toolkit.prepare_workflow.return_value = {'status': 'missing_inputs'}
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory, patch(
+        'lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit', return_value=toolkit,
+    ):
+        client_factory.return_value.get_workflow.return_value.result = {
+            'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+        }
+        contribution = resolve_workflow_injection(
+            None, current_query='run it', conversation_id='conversation-1',
+            workflow_catalog=[{'workflow_ref': 'builtin:image-workflow',
+                               'workflow_id': 'image-workflow', 'revision_id': 'revision-1'}],
+            allowed_workflow_refs=['builtin:image-workflow'],
+            workflow_activations=[{'workflow_ref': 'builtin:image-workflow',
+                                   'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+                                   'tool_name': 'trigger_image_workflow'}],
+        )
+
+        result = _tool(contribution, 'trigger_image_workflow')()
+
+    assert result['status'] == 'waiting'
+    assert result['outcome'] == 'waiting_for_input'
+    toolkit.advance_step.assert_not_called()
+
+
+def test_enabled_workflow_without_catalog_exposes_only_lazy_authoring_group():
+    contribution = resolve_workflow_injection(None, workflow_catalog=[])
+
+    assert contribution.runtime_context == ''
+    assert _tool_names(contribution) >= {'workflow_authoring', 'create_workflow_draft'}
+    assert 'get_workflow' not in _tool_names(contribution)
+
+
+def test_model_tool_projection_hides_controller_lifecycle_tools_without_session():
+    contribution = resolve_workflow_injection(None, workflow_catalog=[])
+
+    names = _tool_names(contribution)
+    assert 'prepare_workflow' not in names
+    assert 'start_workflow' not in names
+    assert 'stop_workflow' not in names
+    assert 'resume_workflow' not in names
+
+
+@pytest.mark.parametrize('status', ['active', 'waiting', 'failed', 'completed', 'stopped'])
+def test_existing_session_hides_controller_lifecycle_tools(status):
+    with patch('lazymind.chat.workflow.workflow_manager._client') as client_factory:
+        client_factory.return_value.get_state.return_value = {
+            'session_id': 'session-1', 'status': status, 'state_version': 3,
+        }
+        contribution = resolve_workflow_injection(
+            {'session_id': 'session-1', 'workflow_id': 'image-workflow'},
+            conversation_id='conversation-1',
+            workflow_catalog=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+            }],
+            allowed_workflow_refs=['builtin:image-workflow'],
+            workflow_activations=[{
+                'workflow_ref': 'builtin:image-workflow',
+                'workflow_id': 'image-workflow', 'revision_id': 'revision-1',
+                'tool_name': 'trigger_image_workflow',
+                'tool_description': 'Load selected workflow',
+            }],
+        )
+
+    names = _tool_names(contribution)
+    assert 'trigger_image_workflow' not in names
+    assert 'prepare_workflow' not in names
+    assert 'start_workflow' not in names
+    assert 'stop_workflow' not in names
+    assert 'resume_workflow' not in names
+
+
+def test_existing_session_tools_inject_protocol_and_concurrency_fields():
+    toolkit = MagicMock()
+    toolkit.get_ready_steps.return_value = {
+        'state_version': 7, 'ready_steps': ['draft'],
+        'retryable_steps': [], 'rewindable_steps': [],
+    }
+    toolkit.advance_step.return_value = {'status': 'succeeded'}
+    with patch('lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit',
+               return_value=toolkit), patch(
+        'lazymind.chat.workflow.workflow_manager._client',
+    ) as client_factory:
+        client_factory.return_value.get_state.return_value = {
+            'status': 'active', 'state_version': 7,
+        }
+        contribution = resolve_workflow_injection(
+            {'session_id': 'session-1', 'workflow_id': 'writer'},
+            conversation_id='conversation-1',
+        )
+
+    advance = _tool(contribution, 'advance_step')
+    assert list(inspect.signature(advance).parameters) == ['step_ids']
+    assert list(inspect.signature(_tool(contribution, 'get_workflow_state')).parameters) == []
+    assert advance(['draft']) == {'status': 'succeeded'}
+    args = toolkit.advance_step.call_args.args
+    assert args[0] == 'session-1'
+    assert args[1] == 7
+    assert args[2][0].step_id == 'draft'
+    assert args[2][0].objective == ''
+    assert args[2][0].task_id == ''
+
+
+def test_advance_step_refreshes_state_version_once_on_conflict():
+    toolkit = MagicMock()
+    toolkit.get_ready_steps.side_effect = [
+        {'state_version': 7, 'ready_steps': ['draft']},
+        {'state_version': 8, 'ready_steps': ['draft']},
+    ]
+    toolkit.advance_step.side_effect = [
+        WorkflowClientError('STATE_VERSION_CONFLICT', 'stale'),
+        {'status': 'succeeded'},
+    ]
+    with patch('lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit',
+               return_value=toolkit), patch(
+        'lazymind.chat.workflow.workflow_manager._client',
+    ) as client_factory:
+        client_factory.return_value.get_state.return_value = {
+            'status': 'active', 'state_version': 7,
+        }
+        contribution = resolve_workflow_injection(
+            {'session_id': 'session-1', 'workflow_id': 'writer'},
+            conversation_id='conversation-1',
+        )
+
+    result = _tool(contribution, 'advance_step')(['draft'])
+
+    assert result['status'] == 'succeeded'
+    assert result['state_version_refreshed'] is True
+    assert [call.args[1] for call in toolkit.advance_step.call_args_list] == [7, 8]
+
+
+def test_only_handoff_advance_stops_an_active_workflow_turn():
+    toolkit = MagicMock()
+    with patch('lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit',
+               return_value=toolkit), patch(
+        'lazymind.chat.workflow.workflow_manager._client',
+    ) as client_factory:
+        client_factory.return_value.get_state.return_value = {
+            'status': 'active', 'state_version': 7,
+        }
+        contribution = resolve_workflow_injection(
+            {'session_id': 'session-1', 'workflow_id': 'writer'},
+            conversation_id='conversation-1',
+        )
+
+    assert contribution.stop_tools == ['advance_step_and_hand_off']
+
+
+def test_advance_step_returns_user_notice_when_target_changes_after_conflict():
+    toolkit = MagicMock()
+    toolkit.get_ready_steps.side_effect = [
+        {'state_version': 7, 'ready_steps': ['draft']},
+        {'state_version': 8, 'ready_steps': ['review']},
+    ]
+    toolkit.advance_step.side_effect = WorkflowClientError(
+        'STATE_VERSION_CONFLICT', 'stale',
+    )
+    with patch('lazymind.chat.workflow.workflow_manager.HostWorkflowToolkit',
+               return_value=toolkit), patch(
+        'lazymind.chat.workflow.workflow_manager._client',
+    ) as client_factory:
+        client_factory.return_value.get_state.return_value = {
+            'status': 'active', 'state_version': 7,
+        }
+        contribution = resolve_workflow_injection(
+            {'session_id': 'session-1', 'workflow_id': 'writer'},
+            conversation_id='conversation-1',
+        )
+
+    result = _tool(contribution, 'advance_step')(['draft'])
+
+    assert result['outcome'] == 'workflow_state_changed'
+    assert result['ready_steps'] == ['review']
+    assert toolkit.advance_step.call_count == 1
+
+
+def test_model_frontier_omits_package_prompts_but_preserves_routing_and_approval():
+    from lazymind.chat.workflow.workflow_manager import _compact_model_frontier
+    projection = {'ready': ['review'], 'edges': [{'when': 'user requested images'}],
+                  'nodes': {'review': {'requires_approval': True}}}
+    state = {'graph': {'prompt': 'large package prompt' * 5000}, 'projection': projection,
+             'state_version': 7, 'status': 'active'}
+    payload = {'projection': projection, 'workflow_state': state,
+               'ready_steps': ['review'], 'retryable_steps': ['draft'],
+               'ready_step_details': [{'step_id': 'review', 'requires_approval': True}]}
+    result = _compact_model_frontier(payload)
+    assert 'graph' not in result['workflow_state']
+    assert 'graph' in payload['workflow_state']
+    assert result['projection'] == projection
+    assert result['ready_step_details'] == payload['ready_step_details']
+    assert result['retryable_steps'] == ['draft']
+    frontier = _compact_model_frontier({'projection': state, 'ready_steps': ['review']})
+    assert frontier['projection']['projection'] == projection
+    assert 'graph' not in frontier['projection']
+
+
+@pytest.mark.parametrize('query', [
+    '请重新执行步骤 outline',
+    'Please re-run step outline',
+    '把第一章缩短到 500 字',
+])
+@pytest.mark.parametrize('handoff', [False, True])
+def test_rerun_turn_preserves_session_intent_for_downstream_steps(query, handoff):
+    from lazymind.chat.workflow import workflow_manager as workflows
+
+    lazyllm.globals['agentic_config'].update({
+        'workflow_current_query': query,
+        'query': query,
+        'focused_tab': 'result',
+    })
+    frontier = {
+        'session_id': 'session-1', 'state_version': 7,
+        'ready_steps': ['write_document'], 'retryable_steps': [],
+        'rewindable_steps': ['outline'],
+    }
+    toolkit = MagicMock()
+    toolkit.get_ready_steps.return_value = frontier
+    toolkit.advance_step.return_value = {'status': 'active'}
+    with patch.object(workflows, '_client') as client_factory:
+        client = client_factory.return_value
+        client.get_ready_steps.return_value = frontier
+        client.advance.return_value.result = {'status': 'active'}
+        if handoff:
+            tool = workflows._handoff_tool('session-1')
+        else:
+            tool = next(tool for tool in workflows._safe_session_tools(toolkit, 'session-1')
+                        if tool.__name__ == 'advance_step')
+        for step_id in ['outline', 'write_document']:
+            tool(step_id if handoff else [step_id])
+            command = (client.advance.call_args.args[0].steps[0] if handoff
+                       else toolkit.advance_step.call_args.args[2][0])
+            is_rerun = query != '把第一章缩短到 500 字'
+            assert command.user_input == ('' if is_rerun else query)
+            assert 'result' in command.runtime_instruction
+            if is_rerun:
+                assert query in command.runtime_instruction
