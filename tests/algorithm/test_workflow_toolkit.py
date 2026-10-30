@@ -129,6 +129,29 @@ def test_advance_step_returns_failure_for_chat_agent_retry_decision():
     assert result['next_action']['decision_owner'] == 'ChatAgent'
 
 
+def test_advance_step_preserves_user_stop_instead_of_reporting_failure():
+    client = MagicMock()
+    client.advance.return_value.result = {
+        'accepted': True,
+        'attempt_statuses': {'task-1': 'interrupted'},
+        'attempt_results': [{
+            'task_id': 'task-1', 'step_id': 'generate_ppt', 'attempt': 1,
+            'failure_reason': 'stopped by user',
+        }],
+        'projection': {'retryable': ['generate_ppt']},
+    }
+    toolkit = HostWorkflowToolkit(lambda: client)
+
+    result = toolkit.advance_step('session-1', 1, [{'step_id': 'generate_ppt'}])
+
+    assert result['status'] == 'interrupted'
+    assert result['outcome'] == 'user_stopped'
+    assert result['interrupted_attempts'] == {'task-1': 'interrupted'}
+    assert result['retryable_steps'] == []
+    assert 'failed_attempts' not in result
+    assert 'next_action' not in result
+
+
 def test_advance_step_does_not_retry_missing_media_configuration():
     client = MagicMock()
     toolkit = HostWorkflowToolkit(lambda: client)

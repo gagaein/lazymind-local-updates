@@ -4437,6 +4437,217 @@ def _presentation_contract(
     }
 
 
+_REQUIREMENT_PAGE_RE = re.compile(
+    r'(?:第\s*(\d+)\s*页|\bpage\s*(\d+)\b)', re.IGNORECASE,
+)
+_REQUIREMENT_CLAUSE_SPLIT_RE = re.compile(r'(?<=[。！？!?；;])|\n+')
+
+
+def _requirement_scope(text: str) -> dict[str, Any]:
+    match = _REQUIREMENT_PAGE_RE.search(text)
+    if match:
+        return {'kind': 'page', 'page_no': int(match.group(1) or match.group(2))}
+    return {'kind': 'deck'}
+
+
+def _requirement_category(text: str) -> str:
+    lowered = text.lower()
+    checks = (
+        ('editability', ('可编辑', 'editable')),
+        ('delivery', ('交付', '导出', 'pptx', 'pdf', 'download')),
+        ('asset', ('图片', '图像', '照片', '素材', '配图', 'image', 'photo')),
+        ('data', ('数据', '数值', '来源', '引用', '口径', 'data', 'citation')),
+        ('format', ('页数', '页面数量', '比例', '16:9', '4:3', '中文', '英文', 'language')),
+        ('visual', ('风格', '配色', '颜色', '色号', '字体', '字号', '边距', '留白',
+                    '背景', '版式', '视觉', 'color', 'font', 'margin', 'style')),
+    )
+    for category, markers in checks:
+        if any(marker in lowered for marker in markers):
+            return category
+    return 'content'
+
+
+def _requirement_stages(category: str) -> list[str]:
+    if category == 'visual':
+        return ['style', 'page', 'final']
+    if category in {'format', 'content', 'asset', 'data'}:
+        return ['outline', 'page', 'final']
+    if category == 'editability':
+        return ['page', 'final']
+    if category == 'delivery':
+        return ['final']
+    return ['style', 'outline', 'page', 'final']
+
+
+def _requirement_entry(
+    raw_text: str,
+    *,
+    source: str,
+    priority: int,
+    source_ref: str = '',
+    value: Any = None,
+    key: str = '',
+) -> dict[str, Any]:
+    text = _coerce_str(raw_text).strip()
+    category = _requirement_category(text)
+    scope = _requirement_scope(text)
+    identity = json.dumps({
+        'source': source,
+        'source_ref': source_ref,
+        'raw_text': text,
+        'scope': scope,
+        'category': category,
+        'key': key,
+        'value': value,
+    }, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    entry = {
+        'id': 'req_' + hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16],
+        'source': source,
+        'source_ref': source_ref or None,
+        'priority': priority,
+        'strength': 'hard',
+        'scope': scope,
+        'category': category,
+        'raw_text': text,
+        'applies_to': _requirement_stages(category),
+    }
+    if key:
+        entry['key'] = key
+    if value is not None:
+        entry['value'] = value
+    return entry
+
+
+def _build_requirement_contract(
+    task_pack: dict[str, Any],
+    info_pack: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze explicit requirements already read by the workflow into one contract.
+
+    This is deliberately deterministic and does not reread the source document or
+    call a model. Unknown wording is retained verbatim instead of being discarded
+    merely because the code cannot classify it.
+    """
+    requirements: list[dict[str, Any]] = []
+    direct_query = _coerce_str(
+        info_pack.get('original_user_query') or info_pack.get('user_query'),
+    )
+    clauses = [
+        clause.strip() for clause in _REQUIREMENT_CLAUSE_SPLIT_RE.split(direct_query)
+        if clause.strip()
+    ]
+    for index, clause in enumerate(clauses):
+        requirements.append(_requirement_entry(
+            clause,
+            source='direct_user',
+            source_ref=f'user_query:{index + 1}',
+            priority=400,
+        ))
+
+    style_hint = _coerce_str(
+        (task_pack.get('params') or {}).get('style_hint')
+        or info_pack.get('style_hint'),
+    )
+    if style_hint and style_hint not in direct_query:
+        requirements.append(_requirement_entry(
+            style_hint,
+            source='direct_user',
+            source_ref='style_hint',
+            priority=400,
+            key='style_hint',
+            value=style_hint,
+        ))
+
+    presentation_contract = (
+        (info_pack.get('document_digest') or {}).get('presentation_contract') or {}
+    )
+    if presentation_contract.get('source_is_authoritative') is True:
+        for index, block in enumerate(presentation_contract.get('requirements') or []):
+            if not isinstance(block, dict):
+                continue
+            text = _coerce_str(block.get('text')).strip()
+            if not text:
+                continue
+            requirements.append(_requirement_entry(
+                text,
+                source='source_document',
+                source_ref=_coerce_str(
+                    block.get('source_block_id') or block.get('block_id')
+                    or f'source_requirement:{index + 1}',
+                ),
+                priority=300,
+            ))
+
+    params = task_pack.get('params') or {}
+    page_count = _coerce_int(params.get('page_count'), 0, lo=0)
+    if page_count:
+        requirements.append(_requirement_entry(
+            f'页面数量：{page_count} 页',
+            source='selected_choice',
+            source_ref='task_pack.params.page_count',
+            priority=200,
+            key='page_count',
+            value=page_count,
+        ))
+    if 'generate_background_images' in params:
+        backgrounds = _coerce_bool(params.get('generate_background_images'))
+        requirements.append(_requirement_entry(
+            '启用 AI 生成背景图' if backgrounds else '不使用 AI 生成背景图',
+            source='selected_choice',
+            source_ref='task_pack.params.generate_background_images',
+            priority=200,
+            key='generate_background_images',
+            value=backgrounds,
+        ))
+
+    # Stable de-duplication keeps the first (therefore highest-priority) entry.
+    deduplicated: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for requirement in sorted(requirements, key=lambda item: -int(item['priority'])):
+        semantic_key = json.dumps({
+            'source': requirement['source'],
+            'source_ref': requirement.get('source_ref'),
+            'raw_text': requirement['raw_text'],
+            'key': requirement.get('key'),
+            'value': requirement.get('value'),
+        }, ensure_ascii=False, sort_keys=True)
+        if semantic_key in seen:
+            continue
+        seen.add(semantic_key)
+        deduplicated.append(requirement)
+
+    return {
+        'version': 1,
+        'immutable': True,
+        'precedence': [
+            'direct_user', 'source_document', 'selected_choice', 'inference_or_default',
+        ],
+        'rules': [
+            'A lower-priority generated default may fill only unspecified fields.',
+            'A downstream stage may apply, report a conflict, or report unsupported; it may not silently omit a hard requirement.',
+            'The contract is derived from already-read inputs and must not trigger a second source-document read.',
+        ],
+        'requirements': deduplicated,
+    }
+
+
+def _ensure_requirement_contract(deck: Path) -> dict[str, Any]:
+    """Create the immutable deck requirement contract exactly once."""
+    info_path = deck / 'info_pack.json'
+    task_path = deck / 'task_pack.json'
+    if not info_path.is_file() or not task_path.is_file():
+        return {}
+    info_pack = json.loads(info_path.read_text(encoding='utf-8'))
+    existing = info_pack.get('requirement_contract')
+    if isinstance(existing, dict) and isinstance(existing.get('requirements'), list):
+        return existing
+    task_pack = json.loads(task_path.read_text(encoding='utf-8'))
+    contract = _build_requirement_contract(task_pack, info_pack)
+    info_pack['requirement_contract'] = contract
+    _write_json_atomic(info_path, info_pack)
+    return contract
+
+
 def _source_bundle_root(identity: str) -> Path:
     root = _conversation_root() / _SOURCE_BUNDLE_DIR_NAME / identity[:16]
     root.mkdir(parents=True, exist_ok=True)
@@ -6749,6 +6960,7 @@ def ppt_init_deck(
         try:
             pack, flow = _persist_deck_style_flow(existing, style_flow)
             source = _attach_source_bundle_to_deck(existing)
+            contract = _ensure_requirement_contract(existing)
             attached = _attach_material_images_to_deck(existing)
         except (OSError, json.JSONDecodeError, ToolExecutionError) as exc:
             return _tool_error('ppt_init_deck', f'bound deck source attachment failed: {exc}')
@@ -6760,6 +6972,7 @@ def ppt_init_deck(
             'material_images_attached': attached['attached'],
             'source_bundle_attached': source['attached'],
             'source_version': source['source_version'] or None,
+            'requirement_count': len(contract.get('requirements') or []),
             'next_stage': 'preflight',
             'stage_order': _STAGE_ORDER_HINT,
         })
@@ -6801,12 +7014,15 @@ def ppt_init_deck(
             'language': _infer_language(query),
             'generate_background_images': _coerce_bool(generate_background_images),
             'style_flow': flow,
+            'style_hint': style or None,
         },
         'created_at': now,
         'skill_version': '0.1.0',
     }, ensure_ascii=False, indent=2), encoding='utf-8')
     (deck_dir / 'info_pack.json').write_text(json.dumps({
         'user_query': enriched,
+        'original_user_query': query,
+        'style_hint': style or None,
         'query_normalized': {'topic': topic_text, 'key_points': key_points},
         'user_assets': {
             'reference_images': [],
@@ -6819,6 +7035,7 @@ def ppt_init_deck(
 
     try:
         source = _attach_source_bundle_to_deck(deck_dir)
+        contract = _ensure_requirement_contract(deck_dir)
         attached = _attach_material_images_to_deck(deck_dir)
     except (OSError, json.JSONDecodeError, ToolExecutionError) as exc:
         return _tool_error('ppt_init_deck', f'source attachment failed: {exc}')
@@ -6833,6 +7050,7 @@ def ppt_init_deck(
         'material_images_attached': attached['attached'],
         'source_bundle_attached': source['attached'],
         'source_version': source['source_version'] or None,
+        'requirement_count': len(contract.get('requirements') or []),
         'next_stage': 'preflight',
         'stage_order': _STAGE_ORDER_HINT,
     })
@@ -7364,6 +7582,7 @@ def ppt_build_outline(
             deck = _resolve_deck_dir(resolved_deck)
             pack, flow = _persist_deck_style_flow(deck, style_flow or ppt_mode)
             source = _attach_source_bundle_to_deck(deck)
+            contract = _ensure_requirement_contract(deck)
             attached = _attach_material_images_to_deck(deck)
         except (FileNotFoundError, json.JSONDecodeError, OSError, ToolExecutionError) as exc:
             return _tool_error('ppt_build_outline', f'prepared deck is invalid: {exc}')
@@ -7381,6 +7600,7 @@ def ppt_build_outline(
             'material_images_attached': attached['attached'],
             'source_bundle_attached': source['attached'],
             'source_version': source['source_version'] or None,
+            'requirement_count': len(contract.get('requirements') or []),
         }
     else:
         init_res = ppt_init_deck(

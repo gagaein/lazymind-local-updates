@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gorilla/mux"
 	"lazymind/core/common/orm"
@@ -32,7 +33,11 @@ func TestNativeSessionPauseIsScopedAndWaitsForExecutor(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if err := db.Create(&orm.WorkflowSessionStep{ID: "attempt", TaskID: "target-task", StepID: "write", SessionID: target, Status: "running", LeaseToken: "lease"}).Error; err != nil {
+			leaseExpiresAt := time.Now().UTC().Add(time.Minute)
+			if err := db.Create(&orm.WorkflowSessionStep{ID: "attempt", TaskID: "target-task", StepID: "write", SessionID: target, Status: "running", LeaseToken: "lease", LeaseExpiresAt: &leaseExpiresAt}).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Create(&orm.WorkflowOutbox{ID: "outbox", AttemptID: "attempt", SessionID: target, Status: "claimed", PayloadJSON: json.RawMessage(`{}`)}).Error; err != nil {
 				t.Fatal(err)
 			}
 			var cancelled []string
@@ -74,6 +79,10 @@ func TestNativeSessionPauseIsScopedAndWaitsForExecutor(t *testing.T) {
 			if len(cancelled) != 1 || cancelled[0] != "target-task" {
 				t.Fatalf("wrong cancellation: %v", cancelled)
 			}
+			var stopping orm.WorkflowSessionStep
+			if err := db.First(&stopping, "id = ?", "attempt").Error; err != nil || stopping.LeaseExpiresAt == nil || !stopping.LeaseExpiresAt.Equal(leaseExpiresAt) {
+				t.Fatalf("pause discarded the recovery lease: %+v %v", stopping, err)
+			}
 			paused, _ := GetSession(t.Context(), db.DB, target)
 			if paused.Status != "pausing" {
 				t.Fatalf("premature pause: %s", paused.Status)
@@ -94,8 +103,116 @@ func TestNativeSessionPauseIsScopedAndWaitsForExecutor(t *testing.T) {
 			if err != nil || view.Status != "paused" {
 				t.Fatalf("confirmed pause: %+v %v", view, err)
 			}
+			var outbox orm.WorkflowOutbox
+			if err := db.First(&outbox, "attempt_id = ?", "attempt").Error; err != nil || outbox.Status != "cancelled" {
+				t.Fatalf("confirmed pause left claimed outbox: %+v %v", outbox, err)
+			}
 		})
 	}
+}
+
+func TestNativeStopRecoveryFinalizesExpiredAndLegacyLeases(t *testing.T) {
+	for _, scenario := range []string{"expired-lease", "legacy-missing-lease"} {
+		t.Run(scenario, func(t *testing.T) {
+			db := newTestDB(t)
+			now := time.Now().UTC()
+			stoppedAt := now.Add(-2 * time.Minute)
+			session := orm.WorkflowSession{
+				ID: "pause", ConversationID: "chat", WorkflowID: "test", CreateUserID: "owner",
+				ControllerHost: "lazymind", Status: "pausing", StateVersion: 4,
+				LastStoppedAt: &stoppedAt, CreatedAt: stoppedAt, UpdatedAt: stoppedAt,
+			}
+			if err := db.Create(&session).Error; err != nil {
+				t.Fatal(err)
+			}
+			heartbeatAt := stoppedAt
+			step := orm.WorkflowSessionStep{
+				ID: "attempt", SessionID: session.ID, StepID: "write", TaskID: "task",
+				Status: StepStatusInterrupted, Validity: "effective", LeaseToken: "lease",
+				TerminalCode: "WORKFLOW_STOP_REQUESTED", HeartbeatAt: &heartbeatAt,
+				CreatedAt: stoppedAt, UpdatedAt: stoppedAt,
+			}
+			if scenario == "expired-lease" {
+				expiresAt := now.Add(-time.Minute)
+				step.LeaseExpiresAt = &expiresAt
+			}
+			if err := db.Create(&step).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Create(&orm.WorkflowOutbox{
+				ID: "outbox", AttemptID: step.ID, SessionID: session.ID,
+				Status: "claimed", PayloadJSON: json.RawMessage(`{}`), CreatedAt: stoppedAt, UpdatedAt: stoppedAt,
+			}).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			recovered, err := ReconcileNativeStops(t.Context(), db.DB, now, 30*time.Second)
+			if err != nil || recovered != 1 {
+				t.Fatalf("reconcile recovered=%d err=%v", recovered, err)
+			}
+			if err := db.First(&step, "id = ?", step.ID).Error; err != nil || step.TerminalCode != "WORKFLOW_STOPPED" {
+				t.Fatalf("attempt not finalized: %+v %v", step, err)
+			}
+			if err := db.First(&session, "id = ?", session.ID).Error; err != nil || session.Status != SessionStatusWaiting || session.StateVersion != 5 {
+				t.Fatalf("session not finalized: %+v %v", session, err)
+			}
+			var outbox orm.WorkflowOutbox
+			if err := db.First(&outbox, "attempt_id = ?", step.ID).Error; err != nil || outbox.Status != "cancelled" {
+				t.Fatalf("outbox not cancelled: %+v %v", outbox, err)
+			}
+			var event orm.WorkflowEvent
+			if err := db.Where("session_id = ? AND event_type = ?", session.ID, "workflow.patch").Order("created_at DESC").First(&event).Error; err != nil || !json.Valid(event.PayloadJSON) || !containsJSONField(event.PayloadJSON, "confirmation_source", "lease_expired") {
+				t.Fatalf("missing recovery event: %+v %s %v", event, event.PayloadJSON, err)
+			}
+			if recovered, err = ReconcileNativeStops(t.Context(), db.DB, now.Add(time.Minute), 30*time.Second); err != nil || recovered != 0 {
+				t.Fatalf("reconcile was not idempotent: recovered=%d err=%v", recovered, err)
+			}
+			if err := ConfirmNativeStop(t.Context(), db.DB, step.ID, step.LeaseToken); err != nil {
+				t.Fatalf("late receipt was not idempotent: %v", err)
+			}
+		})
+	}
+}
+
+func TestNativeStopRecoveryWaitsForEveryExecutor(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().UTC()
+	stoppedAt := now.Add(-2 * time.Minute)
+	session := orm.WorkflowSession{ID: "pause", ConversationID: "chat", WorkflowID: "test", CreateUserID: "owner",
+		ControllerHost: "lazymind", Status: "pausing", LastStoppedAt: &stoppedAt, CreatedAt: stoppedAt, UpdatedAt: stoppedAt}
+	if err := db.Create(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range []struct {
+		id      string
+		expires time.Time
+	}{{"expired", now.Add(-time.Minute)}, {"live", now.Add(time.Minute)}} {
+		if err := db.Create(&orm.WorkflowSessionStep{ID: fixture.id, SessionID: session.ID, StepID: fixture.id, TaskID: fixture.id,
+			Status: StepStatusInterrupted, Validity: "effective", LeaseToken: "lease-" + fixture.id,
+			TerminalCode: "WORKFLOW_STOP_REQUESTED", LeaseExpiresAt: &fixture.expires, CreatedAt: stoppedAt, UpdatedAt: stoppedAt}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if recovered, err := ReconcileNativeStops(t.Context(), db.DB, now, 30*time.Second); err != nil || recovered != 1 {
+		t.Fatalf("first reconcile recovered=%d err=%v", recovered, err)
+	}
+	if err := db.First(&session, "id = ?", session.ID).Error; err != nil || session.Status != "pausing" {
+		t.Fatalf("session paused before every executor settled: %+v %v", session, err)
+	}
+	if recovered, err := ReconcileNativeStops(t.Context(), db.DB, now.Add(2*time.Minute), 30*time.Second); err != nil || recovered != 1 {
+		t.Fatalf("second reconcile recovered=%d err=%v", recovered, err)
+	}
+	if err := db.First(&session, "id = ?", session.ID).Error; err != nil || session.Status != SessionStatusWaiting {
+		t.Fatalf("session did not converge: %+v %v", session, err)
+	}
+}
+
+func containsJSONField(payload []byte, key, want string) bool {
+	var value map[string]any
+	if json.Unmarshal(payload, &value) != nil {
+		return false
+	}
+	return value[key] == want
 }
 
 func TestNativeResumeRebindsPauseOwnershipToNewChatTurn(t *testing.T) {

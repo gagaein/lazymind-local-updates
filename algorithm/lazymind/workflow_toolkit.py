@@ -337,20 +337,68 @@ class HostWorkflowToolkit:
         )).result
         statuses = result.get('attempt_statuses') if isinstance(result, dict) else None
         if isinstance(statuses, dict):
-            failed = {
+            attempt_results = result.get('attempt_results') or []
+            terminal = {
                 str(task_id): str(status) for task_id, status in statuses.items()
                 if str(status) in {'failed', 'cancelled', 'interrupted'}
             }
+            failure_reasons = {
+                str(item.get('task_id') or ''): str(item.get('failure_reason') or '').strip()
+                for item in attempt_results
+                if isinstance(item, dict)
+                and str(item.get('task_id') or '') in terminal
+                and str(item.get('failure_reason') or '').strip()
+            }
+            failed = {
+                str(task_id): str(status) for task_id, status in statuses.items()
+                if str(status) == 'failed'
+            }
+            interrupted = {
+                task_id: status for task_id, status in terminal.items()
+                if status in {'cancelled', 'interrupted'}
+            }
+            if interrupted and not failed:
+                projection = result.get('projection') if isinstance(result.get('projection'), dict) else {}
+                retryable = result.get('retryable_steps') or projection.get('retryable') or []
+                reason_values = [reason.lower().replace('-', '_') for reason in failure_reasons.values()]
+                user_stopped = bool(result.get('user_stopped')) or any(
+                    marker in reason
+                    for reason in reason_values
+                    for marker in ('stopped by user', 'user_stopped', 'cancelled by user', 'canceled by user')
+                )
+                if user_stopped:
+                    return {
+                        **result,
+                        'status': 'interrupted',
+                        'outcome': 'user_stopped',
+                        'interrupted_attempts': interrupted,
+                        'failure_reasons': failure_reasons,
+                        'retryable_steps': [],
+                        'command_id': resolved_command_id,
+                    }
+                return {
+                    **result,
+                    'status': 'interrupted',
+                    'outcome': 'execution_interrupted',
+                    'interrupted_attempts': interrupted,
+                    'failure_reasons': failure_reasons,
+                    'retryable_steps': retryable,
+                    'next_action': {
+                        'decision_owner': 'ChatAgent',
+                        'instruction': (
+                            'Do not report an interrupted execution as a model failure. '
+                            'Report its failure reason, and retry only an exact retryable_steps '
+                            'ID when recovery is appropriate.'
+                        ),
+                    },
+                    'command_id': resolved_command_id,
+                }
             if failed:
                 projection = result.get('projection') if isinstance(result.get('projection'), dict) else {}
                 retryable = result.get('retryable_steps') or projection.get('retryable') or []
-                attempt_results = result.get('attempt_results') or []
                 failure_reasons = {
-                    str(item.get('task_id') or ''): str(item.get('failure_reason') or '').strip()
-                    for item in attempt_results
-                    if isinstance(item, dict)
-                    and str(item.get('task_id') or '') in failed
-                    and str(item.get('failure_reason') or '').strip()
+                    task_id: reason for task_id, reason in failure_reasons.items()
+                    if task_id in failed
                 }
                 configuration_missing = any(
                     'MEDIA_CAPABILITY_DEPENDENCY_MISSING' in reason

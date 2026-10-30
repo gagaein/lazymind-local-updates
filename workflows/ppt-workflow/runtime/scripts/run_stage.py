@@ -134,6 +134,160 @@ def _write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _requirements_for_stage(
+    info_pack: dict,
+    stage: str,
+    *,
+    page_no: int | None = None,
+) -> list[dict]:
+    contract = info_pack.get('requirement_contract') or {}
+    requirements = contract.get('requirements') or []
+    selected: list[dict] = []
+    for requirement in requirements:
+        if not isinstance(requirement, dict) or not requirement.get('id'):
+            continue
+        applies_to = requirement.get('applies_to') or []
+        owns_stage = (
+            stage == 'combined' and bool({'style', 'outline'} & set(applies_to))
+        ) or stage in applies_to
+        if not owns_stage:
+            continue
+        scope = requirement.get('scope') or {'kind': 'deck'}
+        if stage == 'page' and scope.get('kind') == 'page':
+            try:
+                if int(scope.get('page_no')) != int(page_no or 0):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        selected.append(requirement)
+    return sorted(selected, key=lambda item: (-int(item.get('priority') or 0), item['id']))
+
+
+def _requirement_payload(
+    info_pack: dict,
+    stage: str,
+    *,
+    page_no: int | None = None,
+) -> dict | None:
+    contract = info_pack.get('requirement_contract') or {}
+    requirements = _requirements_for_stage(info_pack, stage, page_no=page_no)
+    if not requirements:
+        return None
+    return {
+        'version': contract.get('version', 1),
+        'precedence': contract.get('precedence') or [],
+        'rules': contract.get('rules') or [],
+        'requirements': requirements,
+    }
+
+
+def _requirement_record_path(deck: Path, stage: str, page_no: int | None = None) -> Path:
+    suffix = f'-{int(page_no):03d}' if page_no is not None else ''
+    return deck / 'requirement_coverage' / f'{stage}{suffix}.json'
+
+
+def _record_requirement_application(
+    deck: Path,
+    info_pack: dict,
+    stage: str,
+    evidence: str,
+    *,
+    page_no: int | None = None,
+) -> None:
+    requirements = _requirements_for_stage(info_pack, stage, page_no=page_no)
+    if not requirements:
+        return
+    path = _requirement_record_path(deck, stage, page_no)
+    payload = {
+        'stage': stage,
+        'page_no': page_no,
+        'status': 'applied',
+        'requirement_ids': [item['id'] for item in requirements],
+        'evidence': evidence,
+    }
+    tmp = path.with_name(path.name + '.tmp')
+    _write_text(tmp, json.dumps(payload, ensure_ascii=False, indent=2))
+    os.replace(tmp, path)
+
+
+def _validate_requirement_coverage(
+    deck: Path,
+    info_pack: dict,
+    *,
+    page_count: int,
+) -> list[dict]:
+    contract = info_pack.get('requirement_contract') or {}
+    requirements = contract.get('requirements') or []
+    missing: list[dict] = []
+    for requirement in requirements:
+        if not isinstance(requirement, dict) or requirement.get('strength') != 'hard':
+            continue
+        requirement_id = requirement.get('id')
+        if not requirement_id:
+            continue
+        expected: list[tuple[str, int | None]] = []
+        applies_to = requirement.get('applies_to') or []
+        if 'style' in applies_to:
+            expected.append(('style', None))
+        if 'outline' in applies_to:
+            expected.append(('outline', None))
+        if 'page' in applies_to:
+            scope = requirement.get('scope') or {'kind': 'deck'}
+            if scope.get('kind') == 'page':
+                expected.append(('page', int(scope.get('page_no') or 0)))
+            else:
+                expected.extend(('page', page) for page in range(1, page_count + 1))
+        absent: list[str] = []
+        for stage, page_no in expected:
+            path = _requirement_record_path(deck, stage, page_no)
+            try:
+                record = _load_json(path)
+            except (OSError, ValueError, TypeError):
+                record = {}
+            if requirement_id not in (record.get('requirement_ids') or []):
+                absent.append(f'{stage}:{page_no}' if page_no is not None else stage)
+        if absent:
+            missing.append({'id': requirement_id, 'missing': absent})
+    return missing
+
+
+def _write_requirement_report(
+    deck: Path,
+    info_pack: dict,
+    *,
+    page_count: int,
+    missing: list[dict],
+) -> Path | None:
+    requirements = ((info_pack.get('requirement_contract') or {}).get('requirements') or [])
+    if not requirements:
+        return None
+    missing_by_id = {item['id']: item['missing'] for item in missing}
+    results = []
+    for requirement in requirements:
+        requirement_id = requirement.get('id')
+        if not requirement_id:
+            continue
+        absent = missing_by_id.get(requirement_id)
+        results.append({
+            'id': requirement_id,
+            'status': 'unsupported' if absent else 'applied',
+            'missing': absent or [],
+            'raw_text': requirement.get('raw_text'),
+        })
+    path = deck / 'requirement_coverage.json'
+    _write_text(path, json.dumps({
+        'version': 1,
+        'page_count': page_count,
+        'summary': {
+            'applied': sum(item['status'] == 'applied' for item in results),
+            'conflict': 0,
+            'unsupported': sum(item['status'] == 'unsupported' for item in results),
+        },
+        'requirements': results,
+    }, ensure_ascii=False, indent=2))
+    return path
+
+
 def _load_prompt(name: str) -> str:
     """Load a prompt file and expand <<<INLINE: path>>> references."""
     p = SKILL_DIR / "prompts" / name
@@ -438,6 +592,7 @@ def _build_brief_page_query(
     brief: str,
     style: dict,
     *,
+    requirement_contract: dict | None = None,
     inherited_image: dict | None = None,
     inherited_image_size: dict | None = None,
     background_image: dict | None = None,
@@ -446,9 +601,9 @@ def _build_brief_page_query(
     lines = [
         "Create this slide from the editable page brief below.",
         "The page brief controls content and layout only.",
-        "Apply the VISUAL DESIGN CONTRACT exactly. It is shared by every slide in the deck.",
+        "Apply the VISUAL DESIGN CONTRACT for every field the user did not specify; it is shared by every slide as the deck-wide default.",
         "Do not infer, select, or substitute a page-specific style, color tone, primary color, palette, or typography.",
-        "If the page brief contains conflicting visual wording, the VISUAL DESIGN CONTRACT wins.",
+        "If generated defaults conflict with the USER REQUIREMENT CONTRACT, the USER REQUIREMENT CONTRACT wins.",
         "",
         "PAGE BRIEF:",
         brief.strip(),
@@ -456,6 +611,14 @@ def _build_brief_page_query(
         "VISUAL DESIGN CONTRACT (JSON):",
         json.dumps(style, ensure_ascii=False, indent=2),
     ]
+    if requirement_contract:
+        lines.extend([
+            "",
+            "USER REQUIREMENT CONTRACT (AUTHORITATIVE JSON):",
+            json.dumps(requirement_contract, ensure_ascii=False, indent=2),
+            "Every hard requirement above must be applied. Never silently omit it; "
+            "if it cannot be satisfied, report that failure instead of substituting a default.",
+        ])
     inherited_path = (inherited_image or {}).get('local_path')
     if inherited_path:
         lines.extend([
@@ -569,7 +732,12 @@ def _load_deck_style(deck: Path) -> dict:
     return _attach_style_rendering_recipe(_load_json(deck / "style_spec.json"))
 
 
-def _repair_style_triple(data: dict, dims: dict) -> tuple[dict, list[str]]:
+def _repair_style_triple(
+    data: dict,
+    dims: dict,
+    *,
+    preserve_user_palette: bool = False,
+) -> tuple[dict, list[str]]:
     """Validate `data`'s (design_style, color_tone, primary_color) triple
     against the curated catalog and auto-repair incompatible picks.
 
@@ -578,6 +746,7 @@ def _repair_style_triple(data: dict, dims: dict) -> tuple[dict, list[str]]:
     the downstream stages (and humans debugging) can see what changed.
     """
     notes: list[str] = []
+    user_palette = dict(data.get('palette') or {}) if preserve_user_palette else {}
     ds_rows = {s["id"]: s for s in dims.get("design_styles", [])}
     ct_rows = {t["id"]: t for t in dims.get("color_tones", [])}
     pc_rows = {c["id"]: c for c in dims.get("primary_colors", [])}
@@ -657,6 +826,9 @@ def _repair_style_triple(data: dict, dims: dict) -> tuple[dict, list[str]]:
                 f"palette.primary {palette.get('primary')!r} overwritten to {canonical_hex}"
             )
         palette["primary"] = canonical_hex
+    if user_palette:
+        data['palette'] = user_palette
+        notes.append('preserved palette produced from authoritative user requirements')
 
     # Drop any stale legacy fields the LLM might still emit out of habit.
     for stale in ("css_variables", "base_styles", "mood_keywords", "layout_tendency"):
@@ -693,7 +865,13 @@ def _excerpt_raw_docs(info_pack: dict, max_chars: int = 4000) -> str:
     return "\n\n".join(parts)
 
 
-def _normalize_style_sample(sample: dict, index: int, dims: dict | None) -> tuple[dict, list[str]]:
+def _normalize_style_sample(
+    sample: dict,
+    index: int,
+    dims: dict | None,
+    *,
+    preserve_user_palette: bool = False,
+) -> tuple[dict, list[str]]:
     sample_ids = ("A", "B", "C")
     sample_id = sample_ids[index] if index < len(sample_ids) else chr(ord("A") + index)
     if not isinstance(sample, dict):
@@ -703,7 +881,9 @@ def _normalize_style_sample(sample: dict, index: int, dims: dict | None) -> tupl
         style_spec = {}
     repair_notes: list[str] = []
     if dims is not None:
-        style_spec, repair_notes = _repair_style_triple(style_spec, dims)
+        style_spec, repair_notes = _repair_style_triple(
+            style_spec, dims, preserve_user_palette=preserve_user_palette,
+        )
     style_spec = _attach_style_rendering_recipe(style_spec)
     if repair_notes:
         style_spec["_repairs"] = repair_notes
@@ -1000,6 +1180,11 @@ def _select_style_sample(deck: Path, sample_id: str) -> int:
         "rationale": selected.get("rationale"),
     }
     _write_text(deck / "style_spec.json", json.dumps(style_spec, ensure_ascii=False, indent=2))
+    try:
+        ip = _load_json(deck / 'info_pack.json')
+    except (OSError, ValueError, TypeError):
+        ip = {}
+    _record_requirement_application(deck, ip, 'style', 'style_spec.json')
     return _ok(
         path="style_spec.json",
         sample_id=selected.get("sample_id"),
@@ -1073,6 +1258,8 @@ def cmd_ensure_style(deck: Path, *, llm_call=None) -> int:
     """Reuse the deck-wide style; generate only when it is absent or invalid."""
     try:
         if _valid_deck_style(_load_json(deck / "style_spec.json")):
+            ip = _load_json(deck / 'info_pack.json')
+            _record_requirement_application(deck, ip, 'style', 'style_spec.json')
             return _ok(path="style_spec.json", reused=True)
     except (OSError, ValueError):
         pass
@@ -1090,11 +1277,18 @@ def cmd_style(deck: Path, sample_id: str | None = None, *, llm_call=None) -> int
         return _fail("standard mode requires style-samples before style")
     ip = _load_json(deck / "info_pack.json")
     system_prompt = _load_prompt("style_spec.md")
+    requirement_contract = _requirement_payload(ip, 'style')
+    if requirement_contract:
+        system_prompt += (
+            "\nUSER_REQUIREMENT_CONTRACT is authoritative. Generated catalogs and defaults "
+            "may fill only unspecified fields and must never replace a hard user requirement."
+        )
     user_prompt = json.dumps({
         "task_pack_params": tp.get("params", {}),
         "info_pack_query_normalized": ip.get("query_normalized"),
         "info_pack_user_query": ip.get("user_query"),
         "info_pack_document_digest": ip.get("document_digest"),
+        "requirement_contract": requirement_contract,
     }, ensure_ascii=False, indent=2)
     try:
         raw = (llm_call or llm)(system_prompt, user_prompt, request_name='style')
@@ -1107,12 +1301,15 @@ def cmd_style(deck: Path, sample_id: str | None = None, *, llm_call=None) -> int
     repair_notes: list[str] = []
     dims = _load_style_dimensions()
     if dims is not None:
-        data, repair_notes = _repair_style_triple(data, dims)
+        data, repair_notes = _repair_style_triple(
+            data, dims, preserve_user_palette=bool(requirement_contract),
+        )
     data = _attach_style_rendering_recipe(data)
     if repair_notes:
         data["_repairs"] = repair_notes
 
     _write_text(deck / "style_spec.json", json.dumps(data, ensure_ascii=False, indent=2))
+    _record_requirement_application(deck, ip, 'style', 'style_spec.json')
     return _ok(
         path="style_spec.json",
         design_style=data.get("design_style"),
@@ -1129,11 +1326,18 @@ def cmd_style_samples(deck: Path, *, llm_call=None) -> int:
         return _fail("style-samples is only valid when ppt_mode == 'standard'")
     ip = _load_json(deck / "info_pack.json")
     system_prompt = _load_prompt("style_samples.md")
+    requirement_contract = _requirement_payload(ip, 'style')
+    if requirement_contract:
+        system_prompt += (
+            "\nUSER_REQUIREMENT_CONTRACT is authoritative. Every sample must preserve all "
+            "hard requirements; vary only fields the user left unspecified."
+        )
     user_prompt = json.dumps({
         "task_pack_params": tp.get("params", {}),
         "info_pack_query_normalized": ip.get("query_normalized"),
         "info_pack_user_query": ip.get("user_query"),
         "info_pack_document_digest": ip.get("document_digest"),
+        "requirement_contract": requirement_contract,
     }, ensure_ascii=False, indent=2)
     try:
         raw = (llm_call or llm)(system_prompt, user_prompt, request_name='style-samples')
@@ -1150,7 +1354,10 @@ def cmd_style_samples(deck: Path, *, llm_call=None) -> int:
     all_repairs: list[str] = []
     used_triples: set[tuple[int | None, int | None, int | None]] = set()
     for i, sample in enumerate(raw_samples[:3]):
-        normalized, repair_notes = _normalize_style_sample(sample, i, dims)
+        normalized, repair_notes = _normalize_style_sample(
+            sample, i, dims,
+            preserve_user_palette=bool(requirement_contract),
+        )
         spec = normalized.get("style_spec") or {}
         triple = (
             (spec.get("design_style") or {}).get("id"),
@@ -1318,6 +1525,14 @@ def cmd_outline(
     ip = _load_json(deck / "info_pack.json")
     style = {} if generate_style or content_only else _load_deck_style(deck)
     system_prompt = _load_prompt("outline.md")
+    requirement_stage = 'combined' if generate_style else 'outline'
+    requirement_contract = _requirement_payload(ip, requirement_stage)
+    if requirement_contract:
+        system_prompt += (
+            "\nUSER_REQUIREMENT_CONTRACT is authoritative. Keep every hard requirement "
+            "bound to the correct deck or page scope; generated defaults may fill only "
+            "unspecified fields. Never silently omit a requirement."
+        )
     if generate_style:
         system_prompt = (
             "Generate the deck style and outline together in one response. "
@@ -1378,6 +1593,7 @@ def cmd_outline(
         "info_pack_query_normalized": ip.get("query_normalized"),
         "info_pack_user_query": ip.get("user_query"),
         "info_pack_document_digest": ip.get("document_digest"),
+        "requirement_contract": requirement_contract,
         "raw_documents_excerpt": raw_docs or None,
         "available_reference_images": available_reference_images or None,
     }, ensure_ascii=False, indent=2)
@@ -1417,11 +1633,17 @@ def cmd_outline(
                 style = candidate_style
                 dims = _load_style_dimensions()
                 if dims is not None:
-                    style, notes = _repair_style_triple(style, dims)
+                    style, notes = _repair_style_triple(
+                        style, dims,
+                        preserve_user_palette=bool(
+                            _requirement_payload(ip, 'style')
+                        ),
+                    )
                     if notes:
                         style["_repairs"] = notes
                 style = _attach_style_rendering_recipe(style)
                 _write_text(deck / "style_spec.json", json.dumps(style, ensure_ascii=False, indent=2))
+                _record_requirement_application(deck, ip, 'style', 'style_spec.json')
                 data = data.get("outline")
                 # Once style is valid, corrections only address the outline.
                 combined = False
@@ -1470,6 +1692,7 @@ def cmd_outline(
     except ValueError as exc:
         return _fail(f'outline: {exc}')
     _write_text(deck / "outline.json", json.dumps(data, ensure_ascii=False, indent=2))
+    _record_requirement_application(deck, ip, 'outline', 'outline.json')
     return _ok(
         path="outline.json",
         pages=len(pages),
@@ -2092,6 +2315,7 @@ def cmd_page_html_from_brief(
     page_query = _build_brief_page_query(
         brief_text,
         style,
+        requirement_contract=_requirement_payload(ip, 'page', page_no=page_no),
         inherited_image=inherited_image,
         inherited_image_size=inherited_image_size,
         background_image=background_image,
@@ -2127,6 +2351,18 @@ def _write_page_html_from_query(
     rewritten_query = (rewritten_query or '').strip()
     if not rewritten_query:
         return _fail(f'page-html p{page_no}: empty query', page_no=page_no)
+    try:
+        ip = _load_json(deck / 'info_pack.json')
+    except (OSError, ValueError, TypeError):
+        ip = {}
+    requirement_contract = _requirement_payload(ip, 'page', page_no=page_no)
+    if requirement_contract and 'USER REQUIREMENT CONTRACT (AUTHORITATIVE JSON):' not in rewritten_query:
+        rewritten_query += (
+            '\n\nUSER REQUIREMENT CONTRACT (AUTHORITATIVE JSON):\n'
+            + json.dumps(requirement_contract, ensure_ascii=False, indent=2)
+            + '\nEvery hard requirement above outranks generated defaults. Apply it; '
+            'never silently omit or substitute it.'
+        )
     resolved_images = list(inherited_images or ([inherited_image] if inherited_image else []))
     if resolved_images:
         required_payload = []
@@ -2266,6 +2502,9 @@ def _write_page_html_from_query(
 
     out_path = deck / 'pages' / f'page_{page_no:03d}.html'
     _write_text(out_path, html)
+    _record_requirement_application(
+        deck, ip, 'page', str(out_path.relative_to(deck)), page_no=page_no,
+    )
     return _ok(
         page_no=page_no,
         path=str(out_path.relative_to(deck)),
@@ -2293,6 +2532,26 @@ def _resolve_output_format(deck: Path, requested: str | None = None) -> str:
 
 def cmd_export(deck: Path, output_format: str | None = None) -> int:
     fmt = _resolve_output_format(deck, output_format)
+    try:
+        info_pack = _load_json(deck / 'info_pack.json')
+        task_pack = _load_json(deck / 'task_pack.json')
+    except (OSError, ValueError, TypeError):
+        info_pack = {}
+        task_pack = {}
+    page_count = int((task_pack.get('params') or {}).get('page_count') or 0)
+    missing_requirements = _validate_requirement_coverage(
+        deck, info_pack, page_count=page_count,
+    )
+    if missing_requirements:
+        report = _write_requirement_report(
+            deck, info_pack, page_count=page_count, missing=missing_requirements,
+        )
+        return _fail(
+            'requirement coverage incomplete; refusing to export a deck that silently '
+            'dropped hard user requirements',
+            requirement_report=str(report.relative_to(deck)) if report else None,
+            missing_requirements=missing_requirements,
+        )
     converter_name = "html_to_pdf.mjs" if fmt == "pdf" else "html_to_pptx.mjs"
     converter = SKILL_DIR / "scripts" / "export_pptx" / converter_name
     if not converter.exists():
@@ -2323,7 +2582,13 @@ def cmd_export(deck: Path, output_format: str | None = None) -> int:
             failed = info.get("failed")
     except Exception:
         pass
-    return _ok(format=fmt, pages=pages, converted=converted, failed=failed)
+    report = _write_requirement_report(
+        deck, info_pack, page_count=page_count, missing=[],
+    )
+    return _ok(
+        format=fmt, pages=pages, converted=converted, failed=failed,
+        requirement_report=str(report.relative_to(deck)) if report else None,
+    )
 
 
 # ---------------------------------------------------------------------------
