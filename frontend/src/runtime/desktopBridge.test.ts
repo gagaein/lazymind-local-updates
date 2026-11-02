@@ -1,0 +1,280 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  user: vi.fn(),
+}));
+
+vi.mock("./mode", () => ({ isDesktopRuntime: () => false }));
+vi.mock("@/components/auth", () => ({
+  AgentAppsAuth: { getUserInfo: mocks.user },
+}));
+
+import {
+  restartRuntime,
+  agentExecutableBindings,
+  authorizeLocalWorkspace,
+  agentIntegrationStatuses,
+  agentIntegrationAction,
+  bindAgentExecutable,
+  executorIntegrationAction,
+  executorIntegrationPolicies,
+  reauthorizeLocalWorkspace,
+  selectLocalWorkspace,
+} from "./desktopBridge";
+
+describe("browser Assistant Bridge session synchronization", () => {
+  beforeEach(() => {
+    mocks.user.mockReset();
+    vi.restoreAllMocks();
+    Reflect.deleteProperty(window, "lazymindDesktop");
+  });
+
+  it.each([
+    { name: "slow DSH status", request: () => agentIntegrationStatuses(), delay: 20_000, ok: true },
+    { name: "slow DSH disconnect", request: () => agentIntegrationAction("deepseek-harness", "disconnect"), delay: 20_000, ok: true },
+    { name: "stalled DSH disconnect", request: () => agentIntegrationAction("deepseek-harness", "disconnect"), delay: 65_000, ok: false },
+  ])("handles $name within a bounded request budget", async ({ request, delay, ok }) => {
+    vi.useFakeTimers();
+    try {
+      vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+        .mockImplementationOnce((_url, init) => new Promise((resolve, reject) => {
+          const timer = setTimeout(() => resolve(new Response(JSON.stringify({
+            agents: {}, agent: "deepseek-harness", state: "ready",
+          }), { status: 200 })), delay);
+          init?.signal?.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(new DOMException("Request timed out", "AbortError"));
+          }, { once: true });
+        }));
+      const result = request();
+      await vi.advanceTimersByTimeAsync(delay);
+      expect((await result).ok).toBe(ok);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("forwards workspace selection tokens through the narrow Desktop bridge", async () => {
+    const select = vi.fn().mockResolvedValue({ canceled: false, selection_token: "selection" });
+    const reauthorize = vi.fn().mockResolvedValue({ canceled: true });
+    const authorize = vi.fn().mockResolvedValue({ workspace_id: "grant" });
+    Object.defineProperty(window, "lazymindDesktop", {
+      configurable: true,
+      value: {
+        selectLocalWorkspace: select,
+        reauthorizeLocalWorkspace: reauthorize,
+        authorizeLocalWorkspace: authorize,
+      },
+    });
+
+    await expect(selectLocalWorkspace()).resolves.toMatchObject({ selection_token: "selection" });
+    await expect(reauthorizeLocalWorkspace("grant")).resolves.toEqual({ canceled: true });
+    await expect(authorizeLocalWorkspace("selection")).resolves.toMatchObject({ workspace_id: "grant" });
+    expect(reauthorize).toHaveBeenCalledWith("grant");
+    expect(authorize).toHaveBeenCalledWith("selection");
+  });
+
+  it("clears a stale Assistant session before reading status through Desktop IPC", async () => {
+    const status = { agent: "codex", display_name: "Codex", state: "ready" };
+    const desktopStatus = vi.fn().mockResolvedValue({ agents: { codex: status } });
+    const sessionClear = vi.fn().mockResolvedValue({ ok: true });
+    Object.defineProperty(window, "lazymindDesktop", {
+      configurable: true,
+      value: { agentIntegrationStatuses: desktopStatus, assistantSessionClear: sessionClear },
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    const result = await agentIntegrationStatuses();
+
+    expect(result).toEqual({ ok: true, data: { codex: status } });
+    expect(sessionClear).toHaveBeenCalledOnce();
+    expect(desktopStatus).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("updates the Assistant session before reading status through Desktop IPC", async () => {
+    mocks.user.mockReturnValue({ token: "new-access", refreshToken: "new-refresh" });
+    const desktopStatus = vi.fn().mockResolvedValue({ agents: {} });
+    const sessionSet = vi.fn().mockResolvedValue({ ok: true });
+    Object.defineProperty(window, "lazymindDesktop", {
+      configurable: true,
+      value: { agentIntegrationStatuses: desktopStatus, assistantSessionSet: sessionSet },
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    await agentIntegrationStatuses();
+
+    expect(sessionSet).toHaveBeenCalledWith(expect.objectContaining({
+      access_token: "new-access", refresh_token: "new-refresh",
+    }));
+    expect(desktopStatus).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("sends the current web session before reading Agent status", async () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+    mocks.user.mockReturnValue({
+      username: "admin",
+      token: "access",
+      refreshToken: "refresh",
+      role: "system-admin",
+      tenantId: "tenant",
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ agents: {} }), { status: 200 }));
+
+    const result = await agentIntegrationStatuses();
+
+    expect(result).toEqual({ ok: true, data: {} });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:19091/v1/session",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      server_url: window.location.origin,
+      access_token: "access",
+      refresh_token: "refresh",
+    });
+    const platformHeader = new Headers(init.headers).get(
+      "X-LazyMind-Client-Platform",
+    );
+    expect(platformHeader).not.toBeNull();
+    expect(platformHeader || "").toMatch(/^(windows|darwin|linux)$/);
+    expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:19091/v1/agents");
+  });
+
+  it("clears the Bridge session when the web user is signed out", async () => {
+    mocks.user.mockReturnValue(null);
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ agents: {} }), { status: 200 }));
+
+    await agentIntegrationStatuses();
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:19091/v1/session",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  it("reads executor permissions from the local Bridge", async () => {
+    mocks.user.mockReturnValue(null);
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        executors: { codex: { provider: "codex", enabled: false } },
+      }), { status: 200 }));
+
+    const result = await executorIntegrationPolicies();
+
+    expect(result).toEqual({
+      ok: true,
+      data: { codex: { provider: "codex", enabled: false } },
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:19091/v1/executors");
+  });
+
+  it("preserves a structured platform mismatch from the local Bridge", async () => {
+    mocks.user.mockReturnValue(null);
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(JSON.stringify({
+      code: "platform_mismatch",
+      error: "LazyMind is open on windows, but Assistant Bridge is running on linux.",
+      client_platform: "windows",
+      bridge_platform: "linux",
+    }), { status: 409 }));
+
+    const result = await executorIntegrationPolicies();
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "platform_mismatch",
+      error: {
+        message: "LazyMind is open on windows, but Assistant Bridge is running on linux.",
+        code: "platform_mismatch",
+        clientPlatform: "windows",
+        bridgePlatform: "linux",
+      },
+    });
+  });
+
+  it("does not synchronize credentials into a mismatched Bridge", async () => {
+    mocks.user.mockReturnValue({ token: "access", refreshToken: "refresh" });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(JSON.stringify({
+      code: "platform_mismatch",
+      error: "Assistant Bridge platform mismatch",
+      client_platform: "windows",
+      bridge_platform: "linux",
+    }), { status: 409 }));
+
+    const result = await agentIntegrationStatuses();
+
+    expect(result).toMatchObject({ ok: false, reason: "platform_mismatch" });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("changes one executor permission through the local Bridge", async () => {
+    mocks.user.mockReturnValue(null);
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        provider: "workbuddy", enabled: false,
+      }), { status: 200 }));
+
+    const result = await executorIntegrationAction("workbuddy", "disable");
+
+    expect(result).toEqual({
+      ok: true,
+      data: { provider: "workbuddy", enabled: false },
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:19091/v1/executors/workbuddy/disable",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("reads host-local executable bindings without syncing account credentials", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ bindings: { "codex-cli": "D:\\Agents\\codex.cmd" } }), { status: 200 }),
+    );
+
+    const result = await agentExecutableBindings();
+
+    expect(result).toEqual({ ok: true, data: { "codex-cli": "D:\\Agents\\codex.cmd" } });
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:19091/v1/bindings");
+  });
+
+  it("saves a host-local executable binding", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        target: "cursor-cli", configured: true, path: "D:\\Agents\\cursor-agent.exe",
+      }), { status: 200 }),
+    );
+
+    const result = await bindAgentExecutable("cursor-cli", "D:\\Agents\\cursor-agent.exe");
+
+    expect(result).toEqual({
+      ok: true,
+      data: { target: "cursor-cli", configured: true, path: "D:\\Agents\\cursor-agent.exe" },
+    });
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:19091/v1/bindings/cursor-cli");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(String(init.body))).toEqual({ path: "D:\\Agents\\cursor-agent.exe" });
+  });
+
+});
+
+ it("preserves the page during component activation and returns the real restart error", async () => {
+  const restart = vi.fn().mockResolvedValue({ overallStatus: "ready" });
+  Object.defineProperty(window, "lazymindDesktop", { configurable: true, value: { restartRuntime: restart } });
+  expect(await restartRuntime({ reload: false })).toEqual({ ok: true });
+  expect(restart).toHaveBeenCalledWith({ reload: false });
+  const error = new Error("runtime did not become ready");
+  restart.mockRejectedValue(error);
+  expect(await restartRuntime({ reload: false })).toEqual({ ok: false, reason: "failed", error });
+});
