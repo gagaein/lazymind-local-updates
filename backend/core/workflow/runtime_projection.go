@@ -357,6 +357,10 @@ func persistRouteDecision(ctx context.Context, db *gorm.DB, sessionID, from, att
 }
 
 func freezeRouteDecision(ctx context.Context, db *gorm.DB, sessionID, from, taskID string) error {
+	return freezeRouteDecisionWithSnapshot(ctx, db, sessionID, from, taskID, true)
+}
+
+func freezeRouteDecisionWithSnapshot(ctx context.Context, db *gorm.DB, sessionID, from, taskID string, publishSnapshot bool) error {
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		session, err := artifactgraph.LockSession(tx, sessionID)
 		if err != nil {
@@ -398,7 +402,7 @@ func freezeRouteDecision(ctx context.Context, db *gorm.DB, sessionID, from, task
 		if err := persistRouteDecision(ctx, tx, sessionID, from, attempt.ID, decision.Activated, decision.Pruned, decision.Bypassed, decision.Witnesses, session.StateVersion); err != nil {
 			return err
 		}
-		return reconcileSessionProjection(ctx, tx, session)
+		return reconcileSessionProjectionWithSnapshot(ctx, tx, session, publishSnapshot)
 	})
 }
 
@@ -516,6 +520,10 @@ func finalizeHostAttempt(ctx context.Context, db *gorm.DB, sessionID, stepID, at
 // used for admission. Reaching one end edge is insufficient while another
 // effective branch remains current, ready, or blocked.
 func reconcileSessionProjection(ctx context.Context, db *gorm.DB, session *orm.WorkflowSession) error {
+	return reconcileSessionProjectionWithSnapshot(ctx, db, session, true)
+}
+
+func reconcileSessionProjectionWithSnapshot(ctx context.Context, db *gorm.DB, session *orm.WorkflowSession, publishSnapshot bool) error {
 	projected, err := projectSession(ctx, db, session)
 	if err != nil {
 		return err
@@ -554,9 +562,24 @@ func reconcileSessionProjection(ctx context.Context, db *gorm.DB, session *orm.W
 	}
 	session.Status, session.StateVersion = status, session.StateVersion+1
 	projected.Status, projected.StateVersion = status, session.StateVersion
+	if !publishSnapshot {
+		return nil
+	}
+	return appendProjectionSnapshot(db.WithContext(ctx), *session, projected)
+}
+
+func appendSessionProjectionSnapshot(ctx context.Context, db *gorm.DB, session *orm.WorkflowSession) error {
+	projected, err := projectSession(ctx, db, session)
+	if err != nil {
+		return err
+	}
+	return appendProjectionSnapshot(db.WithContext(ctx), *session, projected)
+}
+
+func appendProjectionSnapshot(db *gorm.DB, session orm.WorkflowSession, projected projectionResponse) error {
 	payload, err := json.Marshal(projected)
 	if err != nil {
 		return err
 	}
-	return appendSessionStateEvent(db.WithContext(ctx), *session, "workflow.snapshot", payload)
+	return appendSessionStateEvent(db, session, "workflow.snapshot", payload)
 }

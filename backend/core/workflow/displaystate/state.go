@@ -4,7 +4,6 @@ package displaystate
 
 import (
 	"encoding/json"
-	"errors"
 	"sort"
 	"time"
 
@@ -139,12 +138,27 @@ func readState(db *gorm.DB, session orm.WorkflowSession) (View, error) {
 	// driver receives the durable continuation action. Only the action produced
 	// by this result (or a newer explicit Continue) can prove that hand-off.
 	if session.ControllerHost == "external-agent" && session.ControlProtocol == controlpolicy.Protocol {
-		var handoff orm.WorkflowHostAction
-		err := db.Where(
-			"session_id = ? AND kind = ? AND consumed_at IS NULL AND (execution_id = ? OR (execution_id = '' AND created_at >= ?))",
-			session.ID, "continue", step.ID, step.UpdatedAt,
-		).Order("created_at DESC, id DESC").First(&handoff).Error
-		if err == nil {
+		var candidates []orm.WorkflowHostAction
+		if err := db.Where(
+			"session_id = ? AND kind = ? AND consumed_at IS NULL AND (execution_id = ? OR execution_id = '')",
+			session.ID, "continue", step.ID,
+		).Find(&candidates).Error; err != nil {
+			return View{}, err
+		}
+		var handoff *orm.WorkflowHostAction
+		for i := range candidates {
+			candidate := &candidates[i]
+			// SQLite compares offset timestamps as text. Compare decoded instants so
+			// UTC and local-offset writers keep the same continuation semantics.
+			if candidate.ExecutionID == "" && candidate.CreatedAt.Before(step.UpdatedAt) {
+				continue
+			}
+			if handoff == nil || candidate.CreatedAt.After(handoff.CreatedAt) ||
+				(candidate.CreatedAt.Equal(handoff.CreatedAt) && candidate.ID > handoff.ID) {
+				handoff = candidate
+			}
+		}
+		if handoff != nil {
 			switch handoff.Status {
 			case "pending", "dispatching", "accepted":
 				return View{Status: "running", Reason: "preparing"}, nil
@@ -153,8 +167,6 @@ func readState(db *gorm.DB, session orm.WorkflowSession) (View, error) {
 			case "failed":
 				return View{Status: "failed", Reason: "delivery_failed"}, nil
 			}
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return View{}, err
 		}
 	}
 	return View{Status: "failed", Reason: "no_advance"}, nil

@@ -120,6 +120,39 @@ func TestDurableDisplayStates(t *testing.T) {
 	}
 }
 
+func TestControlledHandoffComparesAbsoluteTime(t *testing.T) {
+	shanghai := time.FixedZone("Asia/Shanghai", 8*60*60)
+	stepInstant := time.Date(2026, 11, 2, 6, 49, 50, 0, time.UTC)
+	for _, sample := range []struct {
+		name       string
+		stepTime   time.Time
+		actionTime time.Time
+		wantStatus string
+		wantReason string
+	}{
+		{name: "UTC baseline", stepTime: stepInstant, actionTime: stepInstant.Add(4 * time.Second), wantStatus: "running", wantReason: "preparing"},
+		{name: "Beijing step followed by UTC action", stepTime: stepInstant.In(shanghai), actionTime: stepInstant.Add(4 * time.Second), wantStatus: "running", wantReason: "preparing"},
+		{name: "older Beijing action cannot hide UTC step", stepTime: stepInstant, actionTime: stepInstant.Add(-4 * time.Second).In(shanghai), wantStatus: "failed", wantReason: "no_advance"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			db := orm.MigrateTestDB(t, &orm.WorkflowSessionStep{}, &orm.WorkflowHostAction{}, &orm.WorkflowReviewCheckpoint{})
+			session := orm.WorkflowSession{ID: "session", Status: "waiting", ControllerHost: "external-agent", ControlProtocol: "workflow.control.v1"}
+			step := orm.WorkflowSessionStep{ID: "attempt", SessionID: session.ID, StepID: "page_prompts", TaskID: "task", Status: "succeeded", Validity: "effective", Attempt: 1, CreatedAt: sample.stepTime.Add(-time.Minute), UpdatedAt: sample.stepTime}
+			if err := db.Create(&step).Error; err != nil {
+				t.Fatal(err)
+			}
+			action := orm.WorkflowHostAction{ID: "handoff", SessionID: session.ID, Kind: "continue", Status: "pending", CreatedAt: sample.actionTime, UpdatedAt: sample.actionTime}
+			if err := db.Create(&action).Error; err != nil {
+				t.Fatal(err)
+			}
+			view, err := Read(db.DB, session)
+			if err != nil || view.Status != sample.wantStatus || view.Reason != sample.wantReason {
+				t.Fatalf("view=%+v err=%v want=%s/%s", view, err, sample.wantStatus, sample.wantReason)
+			}
+		})
+	}
+}
+
 func TestReadErrorIsNotAnExecutionFailure(t *testing.T) {
 	db := orm.MigrateTestDB(t, &orm.WorkflowSession{})
 	if _, err := Read(db.DB, orm.WorkflowSession{ID: "missing-steps-table"}); err == nil {
