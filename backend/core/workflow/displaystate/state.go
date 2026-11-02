@@ -4,11 +4,13 @@ package displaystate
 
 import (
 	"encoding/json"
+	"errors"
 	"sort"
 	"time"
 
 	"gorm.io/gorm"
 	"lazymind/core/common/orm"
+	"lazymind/core/workflow/controlpolicy"
 	"lazymind/core/workflow/graphengine"
 )
 
@@ -132,6 +134,28 @@ func readState(db *gorm.DB, session orm.WorkflowSession) (View, error) {
 	step := current[0]
 	if step.Status != "succeeded" {
 		return View{Status: "failed", Reason: step.Status}, nil
+	}
+	// A controlled workflow yields between successful steps while its external
+	// driver receives the durable continuation action. Only the action produced
+	// by this result (or a newer explicit Continue) can prove that hand-off.
+	if session.ControllerHost == "external-agent" && session.ControlProtocol == controlpolicy.Protocol {
+		var handoff orm.WorkflowHostAction
+		err := db.Where(
+			"session_id = ? AND kind = ? AND consumed_at IS NULL AND (execution_id = ? OR (execution_id = '' AND created_at >= ?))",
+			session.ID, "continue", step.ID, step.UpdatedAt,
+		).Order("created_at DESC, id DESC").First(&handoff).Error
+		if err == nil {
+			switch handoff.Status {
+			case "pending", "dispatching", "accepted":
+				return View{Status: "running", Reason: "preparing"}, nil
+			case "unknown":
+				return View{Status: "running", Reason: "delivery_unknown"}, nil
+			case "failed":
+				return View{Status: "failed", Reason: "delivery_failed"}, nil
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return View{}, err
+		}
 	}
 	return View{Status: "failed", Reason: "no_advance"}, nil
 }

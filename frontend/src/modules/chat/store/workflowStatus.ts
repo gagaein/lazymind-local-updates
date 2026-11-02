@@ -13,7 +13,10 @@ const displayLabels: Record<WorkflowDisplayState['status'], string> = {
   paused: 'chat.workflowStatusPaused', failed: 'chat.workflowStatusFailed',
   interrupted: 'chat.workflowStatusInterrupted', completed: 'chat.workflowStatusDone',
 };
-export const workflowDisplayLabel = (status?: WorkflowDisplayState['status']): string => status ? displayLabels[status] : 'common.loading';
+export const workflowDisplayLabel = (status?: WorkflowDisplayState['status'], reason?: string): string => {
+  if (status === 'running' && reason === 'delivery_unknown') return 'chat.workflowStatusDeliveryUnknown';
+  return status ? displayLabels[status] : 'common.loading';
+};
 
 export interface RuntimeProjectionStatus {
   completed?: boolean;

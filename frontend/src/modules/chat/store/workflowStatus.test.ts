@@ -5,6 +5,9 @@ describe('reconcileWorkflowSessionStatus', () => {
   it('labels a system interruption independently from pause and failure', () => {
     expect(workflowDisplayLabel('interrupted')).toBe('chat.workflowStatusInterrupted');
   });
+  it('labels uncertain host delivery without claiming execution', () => {
+    expect(workflowDisplayLabel('running', 'delivery_unknown')).toBe('chat.workflowStatusDeliveryUnknown');
+  });
   it('does not infer a completed pause from an interrupted attempt', () => {
     expect(reconcileWorkflowSessionStatus('active', {
       status: 'pausing', current: ['edit'],

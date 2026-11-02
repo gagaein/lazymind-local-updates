@@ -374,6 +374,18 @@ describe('shared workflow compact layout', () => {
     expect(screen.getByRole('button', { name: '重试' })).toBeEnabled();
   });
 
+  it('keeps stop authority while host delivery is uncertain without claiming execution', async () => {
+    fixture.session.status = 'waiting';
+    fixture.session.projection!.display = { status: 'running', reason: 'delivery_unknown', approval_step_id: '' };
+    render(<WorkflowPanel conversationId='layout-test' />);
+
+    const label = String(i18n.t('chat.workflowStatusDeliveryUnknown'));
+    expect(await screen.findByRole('button', { name: String(i18n.t('chat.workflowStatusAria', { status: label })) })).toBeVisible();
+    expect(screen.getByText(label)).toBeVisible();
+    expect(screen.getByRole('button', { name: String(i18n.t('chat.workflowStop')) })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: String(i18n.t('chat.workflowRetry')) })).not.toBeInTheDocument();
+  });
+
   it('shows a system interruption without any execution control', async () => {
     fixture.session.status = 'active';
     fixture.session.steps = fixture.session.steps!.map(step => step.step_id === 'write_document'

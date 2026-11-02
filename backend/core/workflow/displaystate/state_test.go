@@ -11,14 +11,24 @@ import (
 
 func TestDurableDisplayStates(t *testing.T) {
 	for _, sample := range []struct {
-		name, session, step, mode, terminalCode, want string
-		stopped, skip, stale, runningSibling          bool
+		name, session, step, mode, terminalCode, deliveryStatus, deliveryScope, want, wantReason string
+		stopped, skip, stale, runningSibling, controlled, deliveryConsumed, deliveryBeforeStep   bool
 	}{
 		{name: "preparing", session: "waiting", want: "running"},
 		{name: "running", session: "active", step: "running", want: "running"},
 		{name: "approval", session: "waiting", step: "succeeded", mode: "human", want: "waiting"},
 		{name: "skip approval", session: "waiting", step: "succeeded", mode: "human", skip: true, want: "failed"},
 		{name: "automatic no advance", session: "waiting", step: "succeeded", mode: "auto", want: "failed"},
+		{name: "controlled session without handoff", session: "waiting", step: "succeeded", mode: "auto", controlled: true, want: "failed", wantReason: "no_advance"},
+		{name: "pending controlled handoff prepares next step", session: "waiting", step: "succeeded", mode: "auto", controlled: true, deliveryStatus: "pending", deliveryScope: "current", want: "running", wantReason: "preparing"},
+		{name: "dispatching controlled handoff prepares next step", session: "waiting", step: "succeeded", mode: "auto", controlled: true, deliveryStatus: "dispatching", deliveryScope: "current", want: "running", wantReason: "preparing"},
+		{name: "accepted controlled handoff prepares next step", session: "waiting", step: "succeeded", mode: "auto", controlled: true, deliveryStatus: "accepted", deliveryScope: "current", want: "running", wantReason: "preparing"},
+		{name: "explicit continuation prepares next step", session: "waiting", step: "succeeded", mode: "auto", controlled: true, deliveryStatus: "accepted", deliveryScope: "empty", want: "running", wantReason: "preparing"},
+		{name: "unknown controlled handoff awaits reconciliation", session: "waiting", step: "succeeded", mode: "auto", controlled: true, deliveryStatus: "unknown", deliveryScope: "current", want: "running", wantReason: "delivery_unknown"},
+		{name: "failed controlled handoff is a delivery failure", session: "waiting", step: "succeeded", mode: "auto", controlled: true, deliveryStatus: "failed", deliveryScope: "current", want: "failed", wantReason: "delivery_failed"},
+		{name: "unrelated handoff does not mask no advance", session: "waiting", step: "succeeded", mode: "auto", controlled: true, deliveryStatus: "accepted", deliveryScope: "other", want: "failed", wantReason: "no_advance"},
+		{name: "consumed handoff does not mask no advance", session: "waiting", step: "succeeded", mode: "auto", controlled: true, deliveryStatus: "accepted", deliveryScope: "current", deliveryConsumed: true, want: "failed", wantReason: "no_advance"},
+		{name: "old explicit continuation does not mask no advance", session: "waiting", step: "succeeded", mode: "auto", controlled: true, deliveryStatus: "accepted", deliveryScope: "empty", deliveryBeforeStep: true, want: "failed", wantReason: "no_advance"},
 		{name: "generic interruption without stop mismatch", session: "waiting", step: "interrupted", mode: "human", want: "failed"},
 		{name: "active interrupted retry is preparing", session: "active", step: "interrupted", mode: "human", want: "running"},
 		{name: "active executor stop without session stop is interrupted", session: "active", step: "interrupted", mode: "human", terminalCode: "WORKFLOW_STOPPED", want: "interrupted"},
@@ -32,9 +42,12 @@ func TestDurableDisplayStates(t *testing.T) {
 		{name: "stale approval ignored", session: "waiting", step: "succeeded", mode: "human", stale: true, want: "running"},
 	} {
 		t.Run(sample.name, func(t *testing.T) {
-			db := orm.MigrateTestDB(t, &orm.WorkflowSessionStep{}, &orm.WorkflowRevision{}, &orm.WorkflowApprovalPreference{}, &orm.WorkflowReviewCheckpoint{})
+			db := orm.MigrateTestDB(t, &orm.WorkflowSessionStep{}, &orm.WorkflowRevision{}, &orm.WorkflowApprovalPreference{}, &orm.WorkflowReviewCheckpoint{}, &orm.WorkflowHostAction{})
 			now := time.Now().UTC()
 			session := orm.WorkflowSession{ID: "session", Status: sample.session, WorkflowID: "workflow", CreateUserID: "owner", WorkflowRevisionID: "revision"}
+			if sample.controlled {
+				session.ControllerHost, session.ControlProtocol = "external-agent", "workflow.control.v1"
+			}
 			if sample.stopped {
 				session.LastStoppedAt = &now
 			}
@@ -43,7 +56,7 @@ func TestDurableDisplayStates(t *testing.T) {
 				t.Fatal(err)
 			}
 			if sample.step != "" {
-				step := orm.WorkflowSessionStep{ID: "attempt", SessionID: session.ID, StepID: "step", TaskID: "task", Status: sample.step, TerminalCode: sample.terminalCode, Attempt: 1, Validity: "effective", CreatedAt: now.Add(-time.Second)}
+				step := orm.WorkflowSessionStep{ID: "attempt", SessionID: session.ID, StepID: "step", TaskID: "task", Status: sample.step, TerminalCode: sample.terminalCode, Attempt: 1, Validity: "effective", CreatedAt: now.Add(-time.Second), UpdatedAt: now.Add(-time.Second)}
 				if sample.stale {
 					step.Validity = "stale"
 				}
@@ -56,6 +69,25 @@ func TestDurableDisplayStates(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if sample.deliveryStatus != "" {
+				executionID := "attempt"
+				if sample.deliveryScope == "empty" {
+					executionID = ""
+				} else if sample.deliveryScope == "other" {
+					executionID = "other-attempt"
+				}
+				createdAt := now
+				if sample.deliveryBeforeStep {
+					createdAt = now.Add(-2 * time.Second)
+				}
+				action := orm.WorkflowHostAction{ID: "handoff", SessionID: session.ID, Kind: "continue", ExecutionID: executionID, Status: sample.deliveryStatus, CreatedAt: createdAt, UpdatedAt: createdAt}
+				if sample.deliveryConsumed {
+					action.ConsumedAt = &now
+				}
+				if err := db.Create(&action).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
 			if sample.runningSibling {
 				if err := db.Create(&orm.WorkflowSessionStep{ID: "sibling", SessionID: session.ID, StepID: "sibling", TaskID: "sibling-task", Status: "pending", Validity: "effective", CreatedAt: now}).Error; err != nil {
 					t.Fatal(err)
@@ -64,6 +96,9 @@ func TestDurableDisplayStates(t *testing.T) {
 			view, err := Read(db.DB, session)
 			if err != nil || view.Status != sample.want {
 				t.Fatalf("view=%+v err=%v want=%s", view, err, sample.want)
+			}
+			if sample.wantReason != "" && view.Reason != sample.wantReason {
+				t.Fatalf("view=%+v want reason=%s", view, sample.wantReason)
 			}
 			if (view.ApprovalStepID != "") != (sample.want == "waiting") {
 				t.Fatalf("unexpected approval: %+v", view)
@@ -126,7 +161,7 @@ func TestChatStopOwnershipSurvivesHandOffAndResume(t *testing.T) {
 func TestParallelReviewUsesEffectiveAttemptAndUnstartedSuccessor(t *testing.T) {
 	for _, scenario := range []string{"pending", "accepted", "newer-failed-attempt", "successor-started", "external-pending", "external-stale"} {
 		t.Run(scenario, func(t *testing.T) {
-			db := orm.MigrateTestDB(t, &orm.WorkflowSessionStep{}, &orm.WorkflowRevision{}, &orm.WorkflowApprovalPreference{}, &orm.WorkflowReviewCheckpoint{})
+			db := orm.MigrateTestDB(t, &orm.WorkflowSessionStep{}, &orm.WorkflowRevision{}, &orm.WorkflowApprovalPreference{}, &orm.WorkflowReviewCheckpoint{}, &orm.WorkflowHostAction{})
 			now := time.Now().UTC()
 			session := orm.WorkflowSession{ID: "session", Status: "waiting", WorkflowRevisionID: "revision"}
 			graph := graphengine.CompiledStateGraph{Nodes: map[string]graphengine.CompiledNode{
