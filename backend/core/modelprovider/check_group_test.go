@@ -124,17 +124,18 @@ func TestCheckGroupFailureDoesNotHidePersistenceErrorOrBypassOwnership(t *testin
 
 func TestCheckGroupRequiresAPIKeyOnlyForDefaultBaseURL(t *testing.T) {
 	tests := []struct {
-		name           string
-		providerName   string
-		defaultBaseURL string
-		storedBaseURL  string
-		requestBody    string
-		wantStatus     int
-		wantAPIKey     string
-		wantSource     string
-		wantURL        string
-		wantStoredURL  string
-		wantSkipAuth   bool
+		name             string
+		providerName     string
+		userProviderName string
+		defaultBaseURL   string
+		storedBaseURL    string
+		requestBody      string
+		wantStatus       int
+		wantAPIKey       string
+		wantSource       string
+		wantURL          string
+		wantStoredURL    string
+		wantSkipAuth     bool
 	}{
 		{
 			name:        "omitted key is rejected",
@@ -189,6 +190,16 @@ func TestCheckGroupRequiresAPIKeyOnlyForDefaultBaseURL(t *testing.T) {
 			wantAPIKey:   "fragment-key",
 			wantSource:   "openrouter",
 			wantURL:      "https://proxy.example.com/v1/",
+		},
+		{
+			name:             "custom display name keeps catalog provider source",
+			providerName:     "Qwen",
+			userProviderName: "Qwen Token Plan",
+			requestBody:      `{"provider_name":"Qwen Token Plan","base_url":"https://dashscope.aliyuncs.com/","api_key":"token-plan-key","dry_run":false}`,
+			wantStatus:       http.StatusOK,
+			wantAPIKey:       "token-plan-key",
+			wantSource:       "qwen",
+			wantURL:          "https://dashscope.aliyuncs.com/",
 		},
 		{
 			name:           "official openrouter suffix is removed after verification",
@@ -252,6 +263,9 @@ func TestCheckGroupRequiresAPIKeyOnlyForDefaultBaseURL(t *testing.T) {
 					CreatedAt:      now,
 					UpdatedAt:      now,
 				},
+			}
+			if tc.userProviderName != "" {
+				userProvider.Name = tc.userProviderName
 			}
 			ciphertext, err := encryptModelProviderAPIKeyForGroup("user-1", "qwen-group", 1, "stored-key")
 			if err != nil {

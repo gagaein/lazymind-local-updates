@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"gorm.io/gorm"
 
 	"lazymind/core/common"
 	"lazymind/core/common/orm"
@@ -572,6 +574,32 @@ func verifyCheckCacheKey(groupID, baseURL, apiKey string) string {
 	return fmt.Sprintf("%x", h)
 }
 
+func canonicalProviderName(ctx context.Context, db *gorm.DB, parent *orm.UserModelProvider) (string, error) {
+	if parent == nil {
+		return "", nil
+	}
+	fallback := strings.TrimSpace(parent.Name)
+	catalogID := strings.TrimSpace(parent.DefaultModelProviderID)
+	if db == nil || catalogID == "" {
+		return fallback, nil
+	}
+	var catalog orm.DefaultModelProvider
+	err := db.WithContext(ctx).
+		Select("name").
+		Where("id = ? AND deleted_at IS NULL", catalogID).
+		Take(&catalog).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return fallback, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if name := strings.TrimSpace(catalog.Name); name != "" {
+		return name, nil
+	}
+	return fallback, nil
+}
+
 // CheckGroup proxies to the algorithm service for connectivity validation.
 // Supports dry_run=true (test only, no DB write) and dry_run=false (test + persist the result).
 func CheckGroup(w http.ResponseWriter, r *http.Request) {
@@ -614,10 +642,15 @@ func CheckGroup(w http.ResponseWriter, r *http.Request) {
 		common.ReplyErr(w, "model provider not found", http.StatusNotFound)
 		return
 	}
-	// The provider in the path is authoritative. A custom Base URL may be an
-	// official API reverse proxy, so it must not change the provider source.
-	source := parent.Name
-	urlStr = LazyLLMBaseURL(parent.Name, urlStr)
+	// Provider display names are user-facing and may differ from the immutable
+	// catalog protocol (for example "Qwen Token Plan" still uses source "qwen").
+	// The path selects the provider; its catalog identity selects the runtime source.
+	source, err := canonicalProviderName(r.Context(), db, &parent)
+	if err != nil {
+		common.ReplyErr(w, "query default model provider failed", http.StatusInternalServerError)
+		return
+	}
+	urlStr = LazyLLMBaseURL(source, urlStr)
 	var group orm.UserModelProviderGroup
 	if err := db.WithContext(r.Context()).
 		Where("id = ? AND user_model_provider_id = ? AND create_user_id = ? AND deleted_at IS NULL", groupID, parentID, userID).

@@ -7,8 +7,14 @@ import (
 
 const desktopOwnerPIDEnvVar = "LAZYMIND_DESKTOP_OWNER_PID"
 
-func processTextMatchesRuntime(paths RuntimePaths, parts ...string) bool {
-	text := strings.Join(parts, " ")
+func processTextMatchesRuntime(paths RuntimePaths, executable string, parts ...string) bool {
+	// The Agent connector has its own lifecycle even when installed beside runtime
+	// services. A shared build/resource directory does not make it a runtime orphan.
+	base := strings.ToLower(filepath.Base(strings.TrimSuffix(executable, " (deleted)")))
+	if base == "lazymind" || base == "lazymind.exe" {
+		return false
+	}
+	text := executable + " " + strings.Join(parts, " ")
 	repo := filepath.Clean(paths.RepoRoot)
 	buildRoot := filepath.Clean(paths.BuildRoot)
 	runtimeRoot := filepath.Clean(paths.RuntimeRoot)

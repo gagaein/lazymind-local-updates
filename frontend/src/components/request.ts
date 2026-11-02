@@ -358,7 +358,7 @@ export const handleError = async (error: AxiosError): Promise<any> => {
               localizeErrorCode(GENERIC_REQUEST_ERROR_CODE),
           });
         }
-        void AgentAppsAuth.logout();
+        AgentAppsAuth.invalidateBrowserSession();
         return Promise.reject(error);
       }
 
@@ -384,7 +384,7 @@ export const handleError = async (error: AxiosError): Promise<any> => {
               localizeErrorCode(GENERIC_REQUEST_ERROR_CODE),
           });
         }
-        void AgentAppsAuth.logout();
+        AgentAppsAuth.invalidateBrowserSession();
         return Promise.reject(error);
       }
 
@@ -426,7 +426,7 @@ export const handleError = async (error: AxiosError): Promise<any> => {
             getLocalizedErrorMessage(refreshError) ||
             localizeErrorCode(GENERIC_REQUEST_ERROR_CODE),
         });
-        void AgentAppsAuth.logout();
+        AgentAppsAuth.invalidateBrowserSession();
         return Promise.reject(refreshError);
       }
     } else {
