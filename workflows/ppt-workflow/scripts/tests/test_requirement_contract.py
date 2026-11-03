@@ -71,6 +71,152 @@ with mock.patch.dict(sys.modules, _import_stubs()):
 
 
 class RequirementContractTest(unittest.TestCase):
+    def test_structured_source_requirements_survive_with_scope_and_exact_values(self) -> None:
+        task_pack = {'params': {'page_count': 9}}
+        info_pack = {
+            'original_user_query': '标题字号为 30-36 pt；制作 9 页中文 PPT。',
+        }
+        source_requirements = TOOLS._source_requirements_payload([
+            {
+                'text': '标题 30–36pt',
+                'source_ref': 'brief.docx:typography',
+                'scope': {'kind': 'deck'},
+                'category': 'visual',
+                'strength': 'hard',
+            },
+            {
+                'text': '正文字号 30–36pt',
+                'source_ref': 'brief.docx:body-typography',
+                'scope': {'kind': 'deck'},
+                'category': 'visual',
+                'strength': 'hard',
+            },
+            {
+                'text': '主色必须使用 #3A2A78，辅色使用 #F2C14E',
+                'source_ref': 'brief.docx:palette',
+                'scope': {'kind': 'deck'},
+                'category': 'visual',
+                'strength': 'hard',
+            },
+            {
+                'text': 'P9 使用深紫背景',
+                'source_ref': 'brief.docx:p9',
+                'scope': {'kind': 'page', 'page_no': 9},
+                'category': 'visual',
+                'strength': 'hard',
+            },
+        ])
+
+        contract = TOOLS._build_requirement_contract(
+            task_pack, info_pack, source_requirements=source_requirements,
+        )
+
+        exact_title = [
+            item for item in contract['requirements']
+            if '标题' in item['raw_text'] and '30' in item['raw_text']
+            and '36' in item['raw_text']
+        ]
+        self.assertEqual(len(exact_title), 2)
+        self.assertEqual(
+            [item['source'] for item in exact_title],
+            ['direct_user', 'source_document'],
+        )
+        self.assertTrue(any(
+            item['raw_text'] == '正文字号 30–36pt'
+            for item in contract['requirements']
+        ))
+        palette = next(
+            item for item in contract['requirements']
+            if '#3A2A78' in item['raw_text']
+        )
+        self.assertEqual(palette['source_ref'], 'brief.docx:palette')
+        page_nine = next(
+            item for item in contract['requirements']
+            if item['raw_text'] == 'P9 使用深紫背景'
+        )
+        self.assertEqual(page_nine['scope'], {'kind': 'page', 'page_no': 9})
+        self.assertEqual(
+            contract['source_requirements_sha256'], source_requirements['sha256'],
+        )
+
+    def test_material_publisher_saves_summary_and_source_requirements_atomically(self) -> None:
+        bundle = {
+            'presentation_contract': {
+                'requirements': [{
+                    'text': '正文 18–22pt',
+                    'source_block_id': 'doc-block-7',
+                }],
+            },
+        }
+        captured: list[list[dict]] = []
+
+        def save(artifacts: list[dict]) -> dict:
+            captured.append(artifacts)
+            return {'status': 'ok', 'saved_count': len(artifacts)}
+
+        with mock.patch.object(
+            TOOLS, '_workflow_input_value',
+            side_effect=lambda slot: bundle if slot == 'source_bundle' else None,
+        ), mock.patch.object(TOOLS, 'save_artifacts', side_effect=save):
+            result = TOOLS.ppt_publish_material_summary(
+                '材料摘要',
+                [{
+                    'text': '左右边距约 6%',
+                    'source_ref': 'upload.pdf:p2',
+                    'scope': {'kind': 'deck'},
+                }],
+            )
+
+        self.assertEqual(result['saved_artifacts'], [
+            'material_summary', 'source_requirements',
+        ])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual([item['key'] for item in captured[0]], [
+            'material_summary', 'source_requirements',
+        ])
+        payload = captured[0][1]['value']
+        self.assertEqual(
+            [item['text'] for item in payload['requirements']],
+            ['正文 18–22pt', '左右边距约 6%'],
+        )
+
+    def test_only_the_same_transport_occurrence_is_not_injected_twice(self) -> None:
+        bundle = {
+            'presentation_contract': {
+                'requirements': [{
+                    'text': '正文 18–22pt',
+                    'source_block_id': 'doc-block-7',
+                }],
+            },
+        }
+        captured: list[list[dict]] = []
+
+        with mock.patch.object(
+            TOOLS, '_workflow_input_value',
+            side_effect=lambda slot: bundle if slot == 'source_bundle' else None,
+        ), mock.patch.object(
+            TOOLS, 'save_artifacts',
+            side_effect=lambda artifacts: captured.append(artifacts) or {
+                'status': 'ok', 'saved_count': len(artifacts),
+            },
+        ):
+            TOOLS.ppt_publish_material_summary('材料摘要', [
+                {
+                    'text': '正文 18–22pt',
+                    'source_ref': 'doc-block-7',
+                },
+                {
+                    'text': '正文 18–22pt',
+                    'source_ref': 'upload.pdf:p3',
+                },
+            ])
+
+        requirements = captured[0][1]['value']['requirements']
+        self.assertEqual(
+            [item['source_ref'] for item in requirements],
+            ['doc-block-7', 'upload.pdf:p3'],
+        )
+
     def test_contract_preserves_unknown_user_requirements_and_source_provenance(self) -> None:
         task_pack = {
             'params': {
@@ -132,6 +278,93 @@ class RequirementContractTest(unittest.TestCase):
             self.assertEqual(result, frozen)
             persisted = json.loads((deck / 'info_pack.json').read_text(encoding='utf-8'))
             self.assertEqual(persisted['requirement_contract'], frozen)
+
+    def test_changed_source_requirements_cannot_silently_reuse_frozen_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            deck = Path(temp)
+            (deck / 'task_pack.json').write_text(json.dumps({
+                'params': {'page_count': 4},
+            }), encoding='utf-8')
+            (deck / 'info_pack.json').write_text(json.dumps({
+                'requirement_contract': {
+                    'version': 2,
+                    'source_requirements_sha256': 'old-sha',
+                    'requirements': [{'id': 'req_frozen'}],
+                },
+            }), encoding='utf-8')
+
+            with mock.patch.object(
+                TOOLS, '_workflow_input_value',
+                side_effect=lambda slot: {
+                    'version': 1,
+                    'sha256': 'new-sha',
+                    'requirements': [],
+                } if slot == 'source_requirements' else None,
+            ):
+                with self.assertRaisesRegex(RuntimeError, 'requirement_contract_stale'):
+                    TOOLS._ensure_requirement_contract(deck)
+
+    def test_explicit_rebuild_refreshes_changed_source_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            deck = Path(temp)
+            (deck / 'task_pack.json').write_text(json.dumps({
+                'params': {'page_count': 4},
+            }), encoding='utf-8')
+            (deck / 'info_pack.json').write_text(json.dumps({
+                'original_user_query': '制作 4 页 PPT',
+                'requirement_contract': {
+                    'version': 2,
+                    'source_requirements_sha256': 'old-sha',
+                    'requirements': [{'id': 'req_frozen'}],
+                },
+            }), encoding='utf-8')
+            refreshed = TOOLS._source_requirements_payload([{
+                'text': '正文 18–22pt',
+                'source_ref': 'brief.docx:7',
+                'scope': {'kind': 'deck'},
+                'category': 'visual',
+                'strength': 'hard',
+            }])
+
+            with mock.patch.object(
+                TOOLS, '_workflow_input_value',
+                side_effect=lambda slot: refreshed
+                if slot == 'source_requirements' else None,
+            ):
+                result = TOOLS._ensure_requirement_contract(
+                    deck, allow_source_refresh=True,
+                )
+
+            self.assertEqual(
+                result['source_requirements_sha256'], refreshed['sha256'],
+            )
+            self.assertTrue(any(
+                item['raw_text'] == '正文 18–22pt'
+                for item in result['requirements']
+            ))
+
+    def test_requirement_summary_groups_global_and_page_scoped_rules(self) -> None:
+        summary = TOOLS._format_requirement_contract_summary({
+            'requirements': [
+                {
+                    'raw_text': '正文 18–22pt',
+                    'scope': {'kind': 'deck'},
+                    'source': 'source_document',
+                    'source_ref': 'brief.docx:7',
+                },
+                {
+                    'raw_text': 'P9 使用深紫背景',
+                    'scope': {'kind': 'page', 'page_no': 9},
+                    'source': 'direct_user',
+                    'source_ref': 'user_query:2',
+                },
+            ],
+        })
+
+        self.assertIn('## 全局要求\n- 正文 18–22pt', summary)
+        self.assertIn('## 第 9 页要求\n- P9 使用深紫背景', summary)
+        self.assertIn('来源：源材料 · brief.docx:7', summary)
+        self.assertIn('来源：用户输入 · user_query:2', summary)
 
 
 if __name__ == '__main__':

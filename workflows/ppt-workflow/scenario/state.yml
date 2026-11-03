@@ -248,10 +248,15 @@ steps:
       cloud document. This is the careful reading pass over the one body frozen
       in analyze_requirements, not a second Feishu read.
 
-      Compare presentation_contract.requirements with requirement_analysis. If
-      the deep read exposes a hard source constraint omitted in the first step,
-      list it explicitly under "第一步遗漏的硬约束" in material_summary; never
-      silently discard it. Then call ppt_materialize_source_images exactly once.
+      Preserve every explicit requirement from every source path. For a bound
+      source_document, reuse its complete presentation_contract. For uploaded
+      PDF/DOC/DOCX/PPT/PPTX files read through the attachment reader, extract the
+      complete source requirement set rather than only differences from
+      requirement_analysis. Requirements include content, exact data and wording,
+      citations, page count, palette, typography, margins, layout, images,
+      editability and delivery rules. Keep source references and page scope when
+      known; never label this canonical set as omissions. Then call
+      ppt_materialize_source_images exactly once.
       It downloads the frozen source image tickets without refetching the body and
       without image understanding. If a required source image cannot be
       materialized, report that error and stop. Do not replace an explicit
@@ -384,10 +389,32 @@ steps:
       - registered visual assets (caption + source=kb|web|ai-gen) that will appear in HTML
       - open gaps and assumptions
 
-      Save the result:
-        save_artifact(key='material_summary', content_type='text', value=<summary>)
-
-      Stop after saving.
+      Publish the human-readable summary and the complete structured requirement
+      set atomically by calling exactly once:
+        ppt_publish_material_summary(
+          material_summary=<summary>,
+          source_requirements_json=[
+            {
+              "text":"<one complete explicit source requirement>",
+              "source_ref":"<filename/block/section reference>",
+              "scope":{"kind":"deck"}
+            },
+            {
+              "text":"<one page-specific source requirement>",
+              "source_ref":"<filename/block/section reference>",
+              "scope":{"kind":"page","page_no":1}
+            }
+          ]
+        )
+      The tool automatically injects every requirement from the frozen
+      source_document presentation_contract. Do not copy those same provider
+      records into source_requirements_json. Pass the complete requirements from
+      uploaded/local attachments there; identical wording from a different
+      source must remain a separate record with its own source_ref.
+      Use an empty list only when the reviewed sources contain no explicit
+      presentation requirements. Do not copy ordinary evidence or model-inferred
+      advice into source_requirements_json. Do not call save_artifact for either
+      output. Stop immediately after the package tool succeeds.
     tools:
       - ppt_get_planning_context
       - ppt_read_source_document
@@ -399,6 +426,9 @@ steps:
       - ppt_search_web_images
       - ppt_register_material_images
       - ppt_generate_material_images
+      - ppt_publish_material_summary
+    terminal_tools:
+      - ppt_publish_material_summary
     inputs:
       - material: requirement_analysis
         required: true
@@ -409,6 +439,8 @@ steps:
     outputs:
       - material: material_summary
         required: true
+      - material: source_requirements
+        required: true
       - material: source_read_complete
         required: false
       - material: material_images
@@ -416,6 +448,9 @@ steps:
     acceptance_criteria: |
       material_summary must be saved and must identify uploaded-file findings
       when files are present, references, useful evidence, gaps, and assumptions.
+      source_requirements must be saved in the same terminal tool call and must
+      contain the complete explicit source requirement set (or a validated empty
+      list when none exists), with page scope and provenance retained.
       When source_bundle is present, source_read_complete must prove the exact
       frozen revision was read through eof; provider document text must not be
       fetched again. Any first-step hard-requirement miss must be surfaced.
@@ -455,9 +490,11 @@ steps:
       {{runtime_instruction}}
 
       First call ppt_get_planning_context exactly once and use its bound
-      requirement_analysis, material_summary and source-document contract when
-      preparing the three previews. Do not reconstruct those inputs from chat
-      memory or from prompt placeholders.
+      requirement_analysis, material_summary, source_requirements and
+      source-document context when preparing the three previews. The complete
+      structured source requirements remain authoritative even when the readable
+      material summary or outline is shorter. Do not reconstruct those inputs
+      from chat memory or from prompt placeholders.
 
       Call ppt_prepare_style_choices exactly once. Pass the merged request,
       positive page count, audience/scene, only the user's explicit style
@@ -484,6 +521,8 @@ steps:
       - material: material_summary
         required: false
       - material: source_bundle
+        required: false
+      - material: source_requirements
         required: false
       - material: style_flow
         required: true
@@ -530,11 +569,14 @@ steps:
       {{runtime_instruction}}
 
       Before writing a new full-deck outline, call ppt_get_planning_context
-      exactly once. Treat its source_document.presentation_contract and anchored
-      source_excerpt as authoritative. Preserve every explicit source requirement
-      in outline_markdown and retain every required source asset for the internal
-      image-binding stage. Incremental whole-slide insertion may skip this call
-      because it uses the existing deck bundle.
+      exactly once. Treat its source_requirements and
+      source_document.presentation_contract as the complete authoritative
+      requirement input, and use anchored source_excerpt for content context.
+      Keep the readable outline concise; global style/delivery rules travel in
+      the deck-owned requirement contract and must not be lost merely because
+      they are not repeated in every outline paragraph. Retain every required
+      source asset for the internal image-binding stage. Incremental whole-slide
+      insertion may skip this call because it uses the existing deck bundle.
 
       ## Incremental whole-slide insertion
 
@@ -623,6 +665,8 @@ steps:
         required: false
       - material: source_bundle
         required: false
+      - material: source_requirements
+        required: false
       - material: ppt_capability_requirements
         required: true
       - material: style_flow
@@ -660,8 +704,10 @@ steps:
       {{runtime_instruction}}
 
       First call ppt_get_planning_context exactly once. Use the resolved source
-      contract and asset manifest when writing prompts; do not rely on prompt
-      placeholders to carry artifact bodies.
+      requirements, source-document contract and asset manifest when writing
+      prompts; do not rely on prompt placeholders to carry artifact bodies. The
+      package publisher also publishes a deterministic read-only projection of
+      the same frozen contract beside the editable per-page prompts.
 
       First call ppt_find_deck, then call ppt_publish_outline once with that
       deck_dir. For a new workflow it splits the current approved Markdown into
@@ -693,11 +739,18 @@ steps:
         required: false
       - material: source_bundle
         required: false
+      - material: source_requirements
+        required: false
       - material: background_images
         required: false
     outputs:
+      - material: requirement_contract_summary
+        required: true
       - material: slide_outline
     acceptance_criteria: |
+      requirement_contract_summary must be a deterministic, read-only projection
+      of the deck's frozen complete requirement contract and must be published in
+      the same tool call as the page prompts.
       slide_outline must contain exactly one non-empty, editable generation
       prompt per requested page with aligned sort_order.
 
@@ -736,9 +789,10 @@ steps:
       {{runtime_instruction}}
 
       First call ppt_get_planning_context exactly once and use its bound
-      requirement_analysis, material_summary and source-document contract when
-      writing the background prompts. Do not infer missing inputs from empty
-      prompt placeholders.
+      requirement_analysis, material_summary, source_requirements and
+      source-document context when writing the background prompts. The complete
+      structured source requirements remain authoritative even when summaries
+      are shorter. Do not infer missing inputs from empty prompt placeholders.
 
       Prepare the deck before writing the prompts:
       - For a new auto task, call ppt_init_deck with the analyzed request, exact
@@ -797,6 +851,8 @@ steps:
       - material: material_summary
         required: false
       - material: source_bundle
+        required: false
+      - material: source_requirements
         required: false
       - material: style_flow
         required: true
@@ -1055,6 +1111,8 @@ steps:
       - material: requirement_analysis
         required: true
       - material: material_summary
+        required: false
+      - material: source_requirements
         required: false
       - material: material_images
         required: false

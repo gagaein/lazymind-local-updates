@@ -107,7 +107,9 @@ class StyleRenderingRecipeTest(unittest.TestCase):
         self.assertEqual(state['steps']['generate_ppt']['mode'], 'human')
 
     def test_source_read_is_split_between_requirement_scan_and_frozen_deep_read(self) -> None:
+        workflow_path = Path(__file__).resolve().parents[3] / 'workflow.yaml'
         state_path = Path(__file__).resolve().parents[3] / 'scenario' / 'state.yml'
+        workflow = yaml.safe_load(workflow_path.read_text(encoding='utf-8'))
         state = yaml.safe_load(state_path.read_text(encoding='utf-8'))
 
         analyze = state['steps']['analyze_requirements']
@@ -125,6 +127,27 @@ class StyleRenderingRecipeTest(unittest.TestCase):
         self.assertNotIn('source_bundle', [
             item['material'] for item in collect_materials['outputs']
         ])
+        self.assertEqual(
+            collect_materials['terminal_tools'], ['ppt_publish_material_summary'],
+        )
+        self.assertIn('ppt_publish_material_summary', collect_materials['tools'])
+        self.assertIn(
+            'ppt_publish_material_summary', workflow['tool_scripts'][0]['functions'],
+        )
+        self.assertIn('source_requirements', [
+            item['material'] for item in collect_materials['outputs']
+        ])
+        for step_id in (
+            'choose_style', 'plan_background_prompts', 'build_outline',
+            'plan_page_prompts', 'generate_ppt',
+        ):
+            self.assertIn('source_requirements', [
+                item['material'] for item in state['steps'][step_id]['inputs']
+            ])
+        plan_outputs = {
+            item['material']: item for item in state['steps']['plan_page_prompts']['outputs']
+        }
+        self.assertTrue(plan_outputs['requirement_contract_summary']['required'])
         self.assertEqual(analyze['capabilities'], ['feishu'])
         self.assertEqual(collect_materials['capabilities'], ['feishu'])
 
@@ -181,8 +204,12 @@ class StyleRenderingRecipeTest(unittest.TestCase):
             self.assertEqual(tab['slot_scope'], 'step')
         self.assertEqual(
             page_prompts['composite_layout']['children'],
-            [{'slot': 'slide_outline'}],
+            [
+                {'slot': 'requirement_contract_summary'},
+                {'slot': 'slide_outline'},
+            ],
         )
+        self.assertEqual(page_prompts['composite_layout']['direction'], 'column')
         self.assertIn(
             'rewind to plan_background_prompts',
             workflow['runtime']['completed_edit_routing'],

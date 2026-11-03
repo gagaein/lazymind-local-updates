@@ -4438,15 +4438,21 @@ def _presentation_contract(
 
 
 _REQUIREMENT_PAGE_RE = re.compile(
-    r'(?:第\s*(\d+)\s*页|\bpage\s*(\d+)\b)', re.IGNORECASE,
+    r'(?:第\s*(\d+)\s*页|\bpage\s*(\d+)\b|\bP\s*(\d+)\b)', re.IGNORECASE,
 )
 _REQUIREMENT_CLAUSE_SPLIT_RE = re.compile(r'(?<=[。！？!?；;])|\n+')
+_REQUIREMENT_CATEGORIES = frozenset({
+    'content', 'visual', 'format', 'asset', 'data', 'editability', 'delivery',
+})
 
 
 def _requirement_scope(text: str) -> dict[str, Any]:
     match = _REQUIREMENT_PAGE_RE.search(text)
     if match:
-        return {'kind': 'page', 'page_no': int(match.group(1) or match.group(2))}
+        return {
+            'kind': 'page',
+            'page_no': int(match.group(1) or match.group(2) or match.group(3)),
+        }
     return {'kind': 'deck'}
 
 
@@ -4487,16 +4493,19 @@ def _requirement_entry(
     source_ref: str = '',
     value: Any = None,
     key: str = '',
+    scope: Optional[dict[str, Any]] = None,
+    category: str = '',
+    strength: str = 'hard',
 ) -> dict[str, Any]:
     text = _coerce_str(raw_text).strip()
-    category = _requirement_category(text)
-    scope = _requirement_scope(text)
+    resolved_category = category if category in _REQUIREMENT_CATEGORIES else _requirement_category(text)
+    resolved_scope = scope if isinstance(scope, dict) else _requirement_scope(text)
     identity = json.dumps({
         'source': source,
         'source_ref': source_ref,
         'raw_text': text,
-        'scope': scope,
-        'category': category,
+        'scope': resolved_scope,
+        'category': resolved_category,
         'key': key,
         'value': value,
     }, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
@@ -4505,11 +4514,11 @@ def _requirement_entry(
         'source': source,
         'source_ref': source_ref or None,
         'priority': priority,
-        'strength': 'hard',
-        'scope': scope,
-        'category': category,
+        'strength': 'soft' if strength == 'soft' else 'hard',
+        'scope': resolved_scope,
+        'category': resolved_category,
         'raw_text': text,
-        'applies_to': _requirement_stages(category),
+        'applies_to': _requirement_stages(resolved_category),
     }
     if key:
         entry['key'] = key
@@ -4518,9 +4527,218 @@ def _requirement_entry(
     return entry
 
 
+def _normalize_source_requirement_scope(raw: Any, text: str) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        kind = _coerce_str(raw.get('kind')).lower()
+        if kind == 'page':
+            page_no = _coerce_int(raw.get('page_no'), 0, lo=0)
+            if page_no > 0:
+                return {'kind': 'page', 'page_no': page_no}
+        if kind == 'deck':
+            return {'kind': 'deck'}
+    return _requirement_scope(text)
+
+
+def _normalize_source_requirements(
+    raw: Any,
+    *,
+    source_prefix: str = 'uploaded_source',
+) -> list[dict[str, Any]]:
+    """Validate one complete, structured source-requirement list."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ToolExecutionError(f'source_requirements_json must be valid JSON: {exc}')
+    if isinstance(raw, dict):
+        raw = raw.get('requirements')
+    if not isinstance(raw, list):
+        raise ToolExecutionError('source_requirements_json must be a JSON list')
+
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(raw, start=1):
+        if isinstance(item, str):
+            item = {'text': item}
+        if not isinstance(item, dict):
+            raise ToolExecutionError(
+                f'source requirement {index} must be a string or object'
+            )
+        text = _coerce_str(item.get('text') or item.get('raw_text')).strip()
+        if not text:
+            raise ToolExecutionError(f'source requirement {index} has empty text')
+        scope = _normalize_source_requirement_scope(item.get('scope'), text)
+        category = _coerce_str(item.get('category')).lower()
+        if category and category not in _REQUIREMENT_CATEGORIES:
+            raise ToolExecutionError(
+                f'source requirement {index} has unsupported category {category!r}'
+            )
+        record = {
+            'text': text,
+            'source_ref': _coerce_str(
+                item.get('source_ref') or item.get('source_block_id')
+                or item.get('block_id') or f'{source_prefix}:{index}'
+            ),
+            'scope': scope,
+            'category': category or _requirement_category(text),
+            'strength': 'soft' if item.get('strength') == 'soft' else 'hard',
+        }
+        normalized.append(record)
+    return normalized
+
+
+def _source_requirements_payload(requirements: list[dict[str, Any]]) -> dict[str, Any]:
+    canonical = json.dumps(
+        requirements, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+    )
+    return {
+        'version': 1,
+        'requirements': requirements,
+        'sha256': hashlib.sha256(canonical.encode('utf-8')).hexdigest(),
+    }
+
+
+def _requirement_summary_line(item: dict[str, Any]) -> str:
+    source = {
+        'direct_user': '用户输入',
+        'source_document': '源材料',
+        'selected_choice': '已确认选项',
+    }.get(_coerce_str(item.get('source')), '其他输入')
+    source_ref = _coerce_str(item.get('source_ref'))
+    provenance = f'{source} · {source_ref}' if source_ref else source
+    return f'- {_coerce_str(item.get("raw_text"))}（来源：{provenance}）'
+
+
+def _format_requirement_contract_summary(contract: dict[str, Any]) -> str:
+    """Render the frozen contract for the existing page-prompt approval."""
+    requirements = [
+        item for item in (contract.get('requirements') or [])
+        if isinstance(item, dict) and _coerce_str(item.get('raw_text'))
+    ]
+    lines = [
+        '# 完整需求契约',
+        '',
+        '以下要求与页面提示词来自同一份冻结契约；页面生成不得以默认值覆盖。',
+    ]
+    global_items = [
+        item for item in requirements
+        if (item.get('scope') or {}).get('kind', 'deck') != 'page'
+    ]
+    page_items: dict[int, list[dict[str, Any]]] = {}
+    for item in requirements:
+        scope = item.get('scope') or {}
+        if scope.get('kind') != 'page':
+            continue
+        page_no = _coerce_int(scope.get('page_no'), 0, lo=0)
+        if page_no > 0:
+            page_items.setdefault(page_no, []).append(item)
+
+    if global_items:
+        lines.extend(['', '## 全局要求'])
+        for item in global_items:
+            lines.append(_requirement_summary_line(item))
+    for page_no in sorted(page_items):
+        lines.extend(['', f'## 第 {page_no} 页要求'])
+        for item in page_items[page_no]:
+            lines.append(_requirement_summary_line(item))
+    return '\n'.join(lines).strip()
+
+
+def _publish_requirement_contract_summary(deck: Path) -> dict[str, Any]:
+    contract = _ensure_requirement_contract(deck)
+    summary = _format_requirement_contract_summary(contract)
+    saved = _save_artifact(
+        key='requirement_contract_summary',
+        content_type='text',
+        value=summary,
+        source_tool='ppt_publish_outline',
+        internal_publish=True,
+    )
+    if _tool_failed(saved):
+        raise ToolExecutionError(
+            'requirement contract summary could not be published: '
+            f'{_tool_fail_reason(saved)}'
+        )
+    return {
+        'requirement_count': len(contract.get('requirements') or []),
+        'chars': len(summary),
+    }
+
+
+def ppt_publish_material_summary(
+    material_summary: str,
+    source_requirements_json: Union[str, list, dict, None] = None,
+) -> dict[str, Any]:
+    """Atomically publish the human material summary and complete source requirements.
+
+    ``source_requirements_json`` contains every explicit requirement discovered in
+    uploaded/attached source files.  Requirements already frozen in a provider
+    source bundle are merged automatically so every source path uses one transport.
+    """
+    summary = _coerce_str(material_summary).strip()
+    if not summary:
+        raise ToolExecutionError('material_summary must be non-empty')
+
+    provided_requirements = _normalize_source_requirements(source_requirements_json)
+    bundle = _json_input_value(_workflow_input_value('source_bundle'))
+    presentation_contract = bundle.get('presentation_contract') or {}
+    bundled = _normalize_source_requirements(
+        presentation_contract.get('requirements') or [],
+        source_prefix='source_document',
+    )
+    bundled_occurrences = {
+        json.dumps({
+            'text': item['text'],
+            'source_ref': item['source_ref'],
+            'scope': item['scope'],
+        }, ensure_ascii=False, sort_keys=True)
+        for item in bundled
+    }
+    requirements = [*bundled]
+    for item in provided_requirements:
+        occurrence = json.dumps({
+            'text': item['text'],
+            'source_ref': item['source_ref'],
+            'scope': item['scope'],
+        }, ensure_ascii=False, sort_keys=True)
+        # The frozen provider contract is auto-injected above. Ignore only the
+        # exact same occurrence if a caller also copied that transport record.
+        if occurrence not in bundled_occurrences:
+            requirements.append(item)
+    payload = _source_requirements_payload(requirements)
+    artifacts = [
+        {
+            'key': 'material_summary',
+            'content_type': 'text',
+            'value': summary,
+            'source_tool': 'ppt_publish_material_summary',
+        },
+        {
+            'key': 'source_requirements',
+            'content_type': 'json',
+            'value': payload,
+            'source_tool': 'ppt_publish_material_summary',
+        },
+    ]
+    saved = save_artifacts(artifacts)
+    if not isinstance(saved, dict) or saved.get('status') != 'ok':
+        raise ToolExecutionError(
+            f'failed to publish PPT materials and source requirements: {saved!r}'
+        )
+    return {
+        'status': 'ok',
+        'source_requirement_count': len(requirements),
+        'source_requirements_sha256': payload['sha256'],
+        'saved_artifacts': [artifact['key'] for artifact in artifacts],
+        'saved_count': saved.get('saved_count', len(artifacts)),
+    }
+
+
 def _build_requirement_contract(
     task_pack: dict[str, Any],
     info_pack: dict[str, Any],
+    source_requirements: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Freeze explicit requirements already read by the workflow into one contract.
 
@@ -4558,25 +4776,51 @@ def _build_requirement_contract(
             value=style_hint,
         ))
 
-    presentation_contract = (
-        (info_pack.get('document_digest') or {}).get('presentation_contract') or {}
-    )
-    if presentation_contract.get('source_is_authoritative') is True:
-        for index, block in enumerate(presentation_contract.get('requirements') or []):
-            if not isinstance(block, dict):
-                continue
-            text = _coerce_str(block.get('text')).strip()
-            if not text:
-                continue
-            requirements.append(_requirement_entry(
-                text,
-                source='source_document',
-                source_ref=_coerce_str(
-                    block.get('source_block_id') or block.get('block_id')
-                    or f'source_requirement:{index + 1}',
-                ),
-                priority=300,
-            ))
+    structured_source = source_requirements or {}
+    structured_requirements = structured_source.get('requirements') or []
+    for index, block in enumerate(structured_requirements):
+        if not isinstance(block, dict):
+            continue
+        text = _coerce_str(block.get('text') or block.get('raw_text')).strip()
+        if not text:
+            continue
+        requirements.append(_requirement_entry(
+            text,
+            source='source_document',
+            source_ref=_coerce_str(
+                block.get('source_ref') or f'structured_source_requirement:{index + 1}'
+            ),
+            priority=300,
+            scope=_normalize_source_requirement_scope(block.get('scope'), text),
+            category=_coerce_str(block.get('category')).lower(),
+            strength=_coerce_str(block.get('strength'), 'hard').lower(),
+        ))
+
+    # Legacy decks may have only document_digest. Once source_requirements exists,
+    # it is the canonical transport and already includes that frozen document
+    # contract, so reading both channels would duplicate the same occurrence.
+    if not structured_requirements:
+        presentation_contract = (
+            (info_pack.get('document_digest') or {}).get('presentation_contract') or {}
+        )
+        if presentation_contract.get('source_is_authoritative') is True:
+            for index, block in enumerate(
+                presentation_contract.get('requirements') or [], start=1,
+            ):
+                if not isinstance(block, dict):
+                    continue
+                text = _coerce_str(block.get('text')).strip()
+                if not text:
+                    continue
+                requirements.append(_requirement_entry(
+                    text,
+                    source='source_document',
+                    source_ref=_coerce_str(
+                        block.get('source_block_id') or block.get('block_id')
+                        or f'source_requirement:{index}',
+                    ),
+                    priority=300,
+                ))
 
     params = task_pack.get('params') or {}
     page_count = _coerce_int(params.get('page_count'), 0, lo=0)
@@ -4600,49 +4844,58 @@ def _build_requirement_contract(
             value=backgrounds,
         ))
 
-    # Stable de-duplication keeps the first (therefore highest-priority) entry.
-    deduplicated: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for requirement in sorted(requirements, key=lambda item: -int(item['priority'])):
-        semantic_key = json.dumps({
-            'source': requirement['source'],
-            'source_ref': requirement.get('source_ref'),
-            'raw_text': requirement['raw_text'],
-            'key': requirement.get('key'),
-            'value': requirement.get('value'),
-        }, ensure_ascii=False, sort_keys=True)
-        if semantic_key in seen:
-            continue
-        seen.add(semantic_key)
-        deduplicated.append(requirement)
+    # Preserve every occurrence and its provenance. Priority orders application;
+    # it never removes a lower-priority requirement that happens to read similarly.
+    ordered_requirements = sorted(
+        requirements, key=lambda item: -int(item['priority']),
+    )
 
     return {
-        'version': 1,
+        'version': 2,
         'immutable': True,
+        'source_requirements_sha256': _coerce_str(structured_source.get('sha256')) or None,
+        'source_requirement_count': len(structured_source.get('requirements') or []),
         'precedence': [
             'direct_user', 'source_document', 'selected_choice', 'inference_or_default',
         ],
         'rules': [
             'A lower-priority generated default may fill only unspecified fields.',
-            'A downstream stage may apply, report a conflict, or report unsupported; it may not silently omit a hard requirement.',
+            'A downstream stage may apply, report a conflict, or report '
+            'unsupported; it may not silently omit a hard requirement.',
             'The contract is derived from already-read inputs and must not trigger a second source-document read.',
         ],
-        'requirements': deduplicated,
+        'requirements': ordered_requirements,
     }
 
 
-def _ensure_requirement_contract(deck: Path) -> dict[str, Any]:
-    """Create the immutable deck requirement contract exactly once."""
+def _ensure_requirement_contract(
+    deck: Path,
+    *,
+    allow_source_refresh: bool = False,
+) -> dict[str, Any]:
+    """Create the deck contract, or refresh it only at an explicit rebuild boundary."""
     info_path = deck / 'info_pack.json'
     task_path = deck / 'task_pack.json'
     if not info_path.is_file() or not task_path.is_file():
         return {}
     info_pack = json.loads(info_path.read_text(encoding='utf-8'))
+    source_requirements = _json_input_value(_workflow_input_value('source_requirements'))
     existing = info_pack.get('requirement_contract')
     if isinstance(existing, dict) and isinstance(existing.get('requirements'), list):
-        return existing
+        current_sha = _coerce_str(source_requirements.get('sha256'))
+        frozen_sha = _coerce_str(existing.get('source_requirements_sha256'))
+        if current_sha and current_sha != frozen_sha:
+            if not allow_source_refresh:
+                raise ToolExecutionError(
+                    'requirement_contract_stale: source requirements changed after '
+                    'the deck contract was frozen; rebuild from build_outline'
+                )
+        else:
+            return existing
     task_pack = json.loads(task_path.read_text(encoding='utf-8'))
-    contract = _build_requirement_contract(task_pack, info_pack)
+    contract = _build_requirement_contract(
+        task_pack, info_pack, source_requirements=source_requirements,
+    )
     info_pack['requirement_contract'] = contract
     _write_json_atomic(info_path, info_pack)
     return contract
@@ -5277,6 +5530,9 @@ def ppt_get_planning_context() -> dict:
     """Resolve the selected Workflow inputs into one bounded planning context."""
     requirement = _coerce_str(_workflow_input_value('requirement_analysis'))
     material = _coerce_str(_workflow_input_value('material_summary'))
+    source_requirements = _json_input_value(
+        _workflow_input_value('source_requirements')
+    )
     bundle = _json_input_value(_workflow_input_value('source_bundle'))
     source_context: dict[str, Any] | None = None
     if bundle:
@@ -5319,6 +5575,7 @@ def ppt_get_planning_context() -> dict:
     return _tool_success('ppt_get_planning_context', {
         'requirement_analysis': requirement,
         'material_summary': material,
+        'source_requirements': source_requirements,
         'source_document': source_context,
         'instruction': (
             'Treat source_document.presentation_contract and anchored source_excerpt '
@@ -6960,7 +7217,9 @@ def ppt_init_deck(
         try:
             pack, flow = _persist_deck_style_flow(existing, style_flow)
             source = _attach_source_bundle_to_deck(existing)
-            contract = _ensure_requirement_contract(existing)
+            contract = _ensure_requirement_contract(
+                existing, allow_source_refresh=True,
+            )
             attached = _attach_material_images_to_deck(existing)
         except (OSError, json.JSONDecodeError, ToolExecutionError) as exc:
             return _tool_error('ppt_init_deck', f'bound deck source attachment failed: {exc}')
@@ -7035,7 +7294,9 @@ def ppt_init_deck(
 
     try:
         source = _attach_source_bundle_to_deck(deck_dir)
-        contract = _ensure_requirement_contract(deck_dir)
+        contract = _ensure_requirement_contract(
+            deck_dir, allow_source_refresh=True,
+        )
         attached = _attach_material_images_to_deck(deck_dir)
     except (OSError, json.JSONDecodeError, ToolExecutionError) as exc:
         return _tool_error('ppt_init_deck', f'source attachment failed: {exc}')
@@ -7582,7 +7843,9 @@ def ppt_build_outline(
             deck = _resolve_deck_dir(resolved_deck)
             pack, flow = _persist_deck_style_flow(deck, style_flow or ppt_mode)
             source = _attach_source_bundle_to_deck(deck)
-            contract = _ensure_requirement_contract(deck)
+            contract = _ensure_requirement_contract(
+                deck, allow_source_refresh=True,
+            )
             attached = _attach_material_images_to_deck(deck)
         except (FileNotFoundError, json.JSONDecodeError, OSError, ToolExecutionError) as exc:
             return _tool_error('ppt_build_outline', f'prepared deck is invalid: {exc}')
@@ -8287,13 +8550,18 @@ def ppt_publish_outline(
                 'ppt_publish_outline',
                 'insert_before requires pages to contain exactly the same one position',
             )
+        contract_summary = _publish_requirement_contract_summary(deck)
         if (deck / 'outline_draft.md').exists() and not insertion:
             result = _publish_text_page_briefs(deck, page_list)
         else:
             result = _publish_slide_outlines_from_disk(
                 deck, page_list, insert_before=insertion or None,
             )
-    except (FileNotFoundError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        result['requirement_contract_summary'] = contract_summary
+    except (
+        FileNotFoundError, ValueError, KeyError, json.JSONDecodeError,
+        ToolExecutionError,
+    ) as exc:
         return _tool_error('ppt_publish_outline', str(exc))
 
     if result.get('published_count', 0) <= 0:
