@@ -530,6 +530,264 @@ class SourceBundleTest(unittest.TestCase):
         )
         register.assert_called_once()
 
+    def test_reused_source_image_counts_occurrences_separately_from_unique_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            blocks = []
+            raw_assets = {}
+            profiles = []
+            for index in range(1, 8):
+                block_id = f'remote-i{index}'
+                caption = f'P{index:02d}'
+                path = root / f'{caption}.png'
+                path.write_bytes(caption.encode())
+                blocks.append({
+                    'node_id': f'local-i{index}', 'type': 'image', 'content': caption,
+                    'provider_binding': {'block_id': block_id},
+                })
+                raw_assets[f'asset-{index}'] = {
+                    'local_path': str(path), 'caption': caption,
+                    'meta': {'provider_block_id': block_id},
+                }
+                profiles.append({'resource_id': f'feishu-image-{block_id}', 'meta': {}})
+            blocks.append({
+                'node_id': 'local-i8', 'type': 'image', 'content': '封面复用',
+                'provider_binding': {'block_id': 'remote-i8'},
+            })
+            profiles.append({
+                'resource_id': 'feishu-image-remote-i8',
+                'summary': 'P01',
+                'meta': {},
+            })
+            source_document = {'blocks': blocks}
+
+            assets, ready_ids = TOOLS._source_assets_from_media({
+                'media_assets': {'assets': raw_assets},
+                'profile_input_resources': profiles,
+            }, source_document)
+
+        self.assertEqual(len(assets), 7)
+        self.assertEqual(len(ready_ids), 8)
+        reused = next(item for item in assets if item['asset_id'] == 'asset-1')
+        self.assertEqual(reused['source_block_ids'], ['remote-i1', 'remote-i8'])
+        self.assertTrue(reused['reuse_allowed'])
+
+    def test_all_source_images_requirement_is_explicit_not_global_default(self) -> None:
+        contract = {'requirements': []}
+        self.assertTrue(TOOLS._source_images_explicitly_required(
+            '请使用源文档中的全部素材图片制作 PPT', contract,
+        ))
+        self.assertFalse(TOOLS._source_images_explicitly_required(
+            '请参考源文档制作 PPT，缺图时可以不用图片', contract,
+        ))
+
+    def test_source_publication_retries_only_the_failed_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            paths = [root / 'one.png', root / 'two.png']
+            for path in paths:
+                path.write_bytes(path.stem.encode())
+            assets = [
+                {
+                    'asset_id': f'asset-{index}', 'local_path': str(path),
+                    'caption': path.stem, 'source_block_id': f'i{index}',
+                    'source_block_ids': [f'i{index}'], 'reuse_allowed': False,
+                }
+                for index, path in enumerate(paths, start=1)
+            ]
+            written: list[dict] = []
+            published: list[dict] = []
+
+            def stage(item, index):
+                return {
+                    'path': str(paths[index]), 'caption': item['caption'],
+                    'alt': item['alt'], 'source': item['source'],
+                }
+
+            responses = iter([
+                {'status': 'ok'},
+                {'success': False, 'error': 'temporary'},
+                {'status': 'ok'},
+            ])
+            with mock.patch.object(
+                TOOLS, '_load_material_manifest', return_value={'images': []},
+            ), mock.patch.object(
+                TOOLS, '_stage_one_material_image', side_effect=stage,
+            ), mock.patch.object(
+                TOOLS, '_write_material_manifest',
+                side_effect=lambda value: written.append(value) or root / 'manifest.json',
+            ), mock.patch.object(
+                TOOLS, '_save_artifact',
+                side_effect=lambda **kwargs: published.append(kwargs) or next(responses),
+            ):
+                result = TOOLS._register_source_material_images(
+                    assets,
+                    source_version='rev-publish',
+                    occurrence_count=2,
+                    source_images_required=True,
+                )
+
+        self.assertEqual([item['sort_order'] for item in published], [1, 2, 2])
+        self.assertEqual(result['publication_attempts'], {
+            'asset-1': 1, 'asset-2': 2,
+        })
+        self.assertTrue(written[0]['source_import']['complete'])
+
+    def test_source_image_retry_only_recollects_the_failed_occurrence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = root / 'first.png'
+            second = root / 'second.png'
+            first.write_bytes(b'first')
+            second.write_bytes(b'second')
+            blocks = [
+                {'node_id': 'i1', 'type': 'image', 'content': '第一张'},
+                {'node_id': 'i2', 'type': 'image', 'content': '第二张'},
+            ]
+            bundle = {
+                'source_url': 'https://example.test/doc/retry',
+                'version': 'rev-retry',
+                'source_image_count': 2,
+                'source_image_occurrence_count': 2,
+                'source_images_required': True,
+                '_media_snapshot': {
+                    'source_document': {'document_id': 'doc', 'blocks': blocks},
+                    'input_resources': [],
+                },
+            }
+            context = SimpleNamespace(params={
+                'session_id': 'session-retry',
+                'remote_inputs': {'source_bundle': bundle},
+            })
+            calls: list[list[str]] = []
+
+            def collect(*_args, **kwargs):
+                ids = [item['node_id'] for item in kwargs['source_document']['blocks']]
+                calls.append(ids)
+                if len(calls) == 1:
+                    return {
+                        'media_assets': {'assets': {'asset-1': {
+                            'local_path': str(first), 'caption': '第一张',
+                            'meta': {'content_ref': {'node_id': 'i1'}},
+                        }}},
+                        'profile_input_resources': [
+                            {'resource_id': 'feishu-image-i1', 'meta': {}},
+                        ],
+                    }
+                return {
+                    'media_assets': {'assets': {'asset-2': {
+                        'local_path': str(second), 'caption': '第二张',
+                        'meta': {'content_ref': {'node_id': 'i2'}},
+                    }}},
+                    'profile_input_resources': [
+                        {'resource_id': 'feishu-image-i2', 'meta': {}},
+                    ],
+                }
+
+            writing = types.ModuleType('lazymind.document_tools.writing')
+            writing.collect_document_media = collect
+            with mock.patch.dict(sys.modules, {
+                'lazymind.document_tools.writing': writing,
+            }), mock.patch.object(
+                TOOLS, 'require_context', return_value=context,
+            ), mock.patch.object(
+                TOOLS, '_conversation_root', return_value=root,
+            ), mock.patch.object(
+                TOOLS, '_register_source_material_images',
+                return_value={'registered': 2, 'total': 2},
+            ) as register:
+                result = TOOLS.ppt_materialize_source_images()
+
+        self.assertEqual(calls, [['i1', 'i2'], ['i2']])
+        self.assertEqual(result['source_image_occurrence_count'], 2)
+        self.assertEqual(result['source_image_unique_asset_count'], 2)
+        self.assertEqual(result['missing_occurrence_ids'], [])
+        self.assertEqual(result['download_attempts'], {'i1': 1, 'i2': 2})
+        registered_assets = register.call_args.args[0]
+        self.assertEqual({item['asset_id'] for item in registered_assets}, {
+            'asset-1', 'asset-2',
+        })
+
+    def test_required_source_image_fails_after_bounded_item_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = {
+                'source_url': 'https://example.test/doc/missing',
+                'version': 'rev-missing',
+                'source_image_count': 1,
+                'source_images_required': True,
+                '_media_snapshot': {
+                    'source_document': {
+                        'document_id': 'doc',
+                        'blocks': [{'node_id': 'i1', 'type': 'image', 'content': '缺图'}],
+                    },
+                    'input_resources': [],
+                },
+            }
+            context = SimpleNamespace(params={
+                'session_id': 'session-missing',
+                'remote_inputs': {'source_bundle': bundle},
+            })
+            collect = mock.Mock(return_value={
+                'media_assets': {'assets': {}},
+                'profile_input_resources': [],
+            })
+            writing = types.ModuleType('lazymind.document_tools.writing')
+            writing.collect_document_media = collect
+            with mock.patch.dict(sys.modules, {
+                'lazymind.document_tools.writing': writing,
+            }), mock.patch.object(
+                TOOLS, 'require_context', return_value=context,
+            ), mock.patch.object(
+                TOOLS, '_conversation_root', return_value=root,
+            ), mock.patch.object(
+                TOOLS, '_register_source_material_images',
+            ) as register, self.assertRaisesRegex(
+                RuntimeError, 'required source image occurrence',
+            ):
+                TOOLS.ppt_materialize_source_images()
+
+        self.assertEqual(collect.call_count, 3)
+        self.assertEqual([
+            call.kwargs['source_document']['blocks'][0]['node_id']
+            for call in collect.call_args_list[1:]
+        ], ['i1', 'i1'])
+        register.assert_not_called()
+
+    def test_terminal_summary_rejects_skipped_required_source_import(self) -> None:
+        bundle = {
+            'version': 'rev-required',
+            'source_image_count': 1,
+            'source_images_required': True,
+            'presentation_contract': {'requirements': []},
+        }
+        context = SimpleNamespace(params={'remote_inputs': {'source_bundle': bundle}})
+        with mock.patch.object(
+            TOOLS, 'require_context', return_value=context,
+        ), mock.patch.object(
+            TOOLS, '_load_material_manifest', return_value={'images': []},
+        ), mock.patch.object(
+            TOOLS, 'save_artifacts',
+        ) as save_batch, self.assertRaisesRegex(
+            RuntimeError, 'required source images were not completely materialized',
+        ):
+            TOOLS.ppt_publish_material_summary('已完成素材整理')
+        save_batch.assert_not_called()
+
+    def test_material_root_isolated_by_workflow_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with mock.patch.object(
+                TOOLS, '_conversation_root', return_value=root,
+            ), mock.patch.object(
+                TOOLS, '_workflow_session_id', side_effect=['session-a', 'session-b'],
+            ):
+                first = TOOLS._material_root()
+                second = TOOLS._material_root()
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.parent, root / 'material_images')
+        self.assertEqual(second.parent, root / 'material_images')
+
     def test_planning_context_reads_bound_revision_and_keeps_source_anchors(self) -> None:
         bundle = {
             'title': '源文档',

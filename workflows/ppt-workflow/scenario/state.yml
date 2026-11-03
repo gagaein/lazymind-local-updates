@@ -454,9 +454,13 @@ steps:
       When source_bundle is present, source_read_complete must prove the exact
       frozen revision was read through eof; provider document text must not be
       fetched again. Any first-step hard-requirement miss must be surfaced.
-      material_images is optional. Its absence must never fail or retry this
-      step; a text-only material_summary is sufficient. When usable KB/web/AI
-      material images were found, they should be
+      KB/web/AI material_images are optional and their absence must not fail
+      this step. Source-document images are different: when the frozen bundle
+      marks all source images as explicitly required, every occurrence must be
+      accounted for and every unique binary must be published before the
+      terminal summary can succeed. A failed source image is retried by itself;
+      already successful images must not be downloaded again. When usable
+      optional KB/web/AI material images were found, they should be
       registered via ppt_register_material_images / ppt_generate_material_images
       as individual image-list artifacts so the Materials tab can preview them
       and later steps can embed them in HTML.
