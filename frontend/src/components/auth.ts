@@ -176,6 +176,13 @@ export const AgentAppsAuth = {
     return `${window.location.origin}${window.BASENAME || ""}/login`;
   },
 
+  invalidateBrowserSession(redirectUrl?: string) {
+    window.dispatchEvent(new Event(AUTH_LOGOUT_EVENT));
+    this.clearUserInfo();
+    const target = redirectUrl || this.getLoginUrl();
+    window.location.href = target;
+  },
+
   async logout(redirectUrl?: string) {
     window.dispatchEvent(new Event(AUTH_LOGOUT_EVENT));
     const session = this.getUserInfo();

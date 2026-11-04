@@ -445,6 +445,20 @@ describe('MarkdownArtifactEditor MDX compatibility', () => {
     expect(fallback).toHaveTextContent('正文仍需可见');
   });
 
+  it('escapes a literal unclosed img tag before passing prose to the MDX parser', () => {
+    const { container } = render(
+      <MarkdownArtifactEditor
+        markdown={'## 已登记视觉素材（将作为前景 <img> 进入 HTML）'}
+        sourceRevision={1}
+        onSave={async () => 1}
+      />,
+    );
+
+    expect(
+      container.querySelector<HTMLElement>('.writer-markdown-editor__surface')?.dataset.markdown,
+    ).toBe('## 已登记视觉素材（将作为前景 \\<img> 进入 HTML）');
+  });
+
   it('renders outline controls only when the document has a heading', () => {
     const withoutHeading = render(
       <MarkdownArtifactEditor

@@ -9,6 +9,7 @@ import (
 
 	"gorm.io/gorm"
 	"lazymind/core/common/orm"
+	"lazymind/core/workflow/controlpolicy"
 	"lazymind/core/workflow/graphengine"
 )
 
@@ -73,6 +74,7 @@ func readState(db *gorm.DB, session orm.WorkflowSession) (View, error) {
 		return current[i].CreatedAt.After(current[j].CreatedAt)
 	})
 	running := false
+	unconfirmedStop := false
 	stoppedAt := time.Time{}
 	if session.LastStoppedAt != nil {
 		stoppedAt = *session.LastStoppedAt
@@ -81,9 +83,8 @@ func readState(db *gorm.DB, session orm.WorkflowSession) (View, error) {
 		switch step.Status {
 		case "pending", "queued", "claimed", "running":
 			running = true
-		}
-		if step.TerminalCode == "WORKFLOW_STOPPED" && step.UpdatedAt.After(stoppedAt) {
-			stoppedAt = step.UpdatedAt
+		case "interrupted", "cancelled", "canceled":
+			unconfirmedStop = unconfirmedStop || step.TerminalCode == "WORKFLOW_STOPPED"
 		}
 	}
 	if session.Status == "pausing" {
@@ -104,13 +105,18 @@ func readState(db *gorm.DB, session orm.WorkflowSession) (View, error) {
 	if session.Status == "completed" {
 		return View{Status: "completed", Reason: "completed"}, nil
 	}
-	// Only an admitted driver or explicit user resume can enter active. Historical
-	// stop markers must not hide that preparation before its new attempt exists.
-	if session.Status == "active" {
-		return View{Status: "running", Reason: "preparing"}, nil
-	}
 	if session.Status == "failed" {
 		return View{Status: "failed", Reason: "execution_failed"}, nil
+	}
+	// WORKFLOW_STOPPED describes the executor outcome, not who requested it.
+	// Only LastStoppedAt or an explicit stopped session proves a user pause.
+	if unconfirmedStop && session.LastStoppedAt == nil && session.Status != "stopped" {
+		return View{Status: "interrupted", Reason: "execution_interrupted"}, nil
+	}
+	// An admitted resume temporarily has no new attempt, so active normally means
+	// preparing before the new attempt is persisted.
+	if session.Status == "active" {
+		return View{Status: "running", Reason: "preparing"}, nil
 	}
 	paused := session.Status == "stopped" || !stoppedAt.IsZero()
 	for _, step := range current {
@@ -127,6 +133,41 @@ func readState(db *gorm.DB, session orm.WorkflowSession) (View, error) {
 	step := current[0]
 	if step.Status != "succeeded" {
 		return View{Status: "failed", Reason: step.Status}, nil
+	}
+	// A controlled workflow yields between successful steps while its external
+	// driver receives the durable continuation action. Only the action produced
+	// by this result (or a newer explicit Continue) can prove that hand-off.
+	if session.ControllerHost == "external-agent" && session.ControlProtocol == controlpolicy.Protocol {
+		var candidates []orm.WorkflowHostAction
+		if err := db.Where(
+			"session_id = ? AND kind = ? AND consumed_at IS NULL AND (execution_id = ? OR execution_id = '')",
+			session.ID, "continue", step.ID,
+		).Find(&candidates).Error; err != nil {
+			return View{}, err
+		}
+		var handoff *orm.WorkflowHostAction
+		for i := range candidates {
+			candidate := &candidates[i]
+			// SQLite compares offset timestamps as text. Compare decoded instants so
+			// UTC and local-offset writers keep the same continuation semantics.
+			if candidate.ExecutionID == "" && candidate.CreatedAt.Before(step.UpdatedAt) {
+				continue
+			}
+			if handoff == nil || candidate.CreatedAt.After(handoff.CreatedAt) ||
+				(candidate.CreatedAt.Equal(handoff.CreatedAt) && candidate.ID > handoff.ID) {
+				handoff = candidate
+			}
+		}
+		if handoff != nil {
+			switch handoff.Status {
+			case "pending", "dispatching", "accepted":
+				return View{Status: "running", Reason: "preparing"}, nil
+			case "unknown":
+				return View{Status: "running", Reason: "delivery_unknown"}, nil
+			case "failed":
+				return View{Status: "failed", Reason: "delivery_failed"}, nil
+			}
+		}
 	}
 	return View{Status: "failed", Reason: "no_advance"}, nil
 }

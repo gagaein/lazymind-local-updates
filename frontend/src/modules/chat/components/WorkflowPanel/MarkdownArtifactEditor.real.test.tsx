@@ -32,6 +32,17 @@ vi.mock('react-i18next',()=>({initReactI18next:{type:'3rdParty',init:()=>undefin
 vi.mock('./ArtifactRewriteDialog',()=>({ArtifactRewriteInlineDiff:()=>null}));
 import { MarkdownArtifactEditor } from './MarkdownArtifactEditor';
 beforeEach(()=>{capture.change=undefined;});
+it('renders a literal unclosed img tag as prose instead of falling back to source',async()=>{
+ const onSave=vi.fn(async()=>2);
+ const {container}=render(<MarkdownArtifactEditor markdown={'## 前景 <img> 进入 HTML'} sourceRevision={1} onSave={onSave} />);
+ await waitFor(()=>expect(container.querySelector('[contenteditable=true]')).toHaveTextContent('前景 <img> 进入 HTML'));
+ expect(container.querySelector('[role=alert]')).toBeNull();
+ await act(async()=>capture.editor!.setMarkdown(capture.editor!.getMarkdown().replace('前景','素材')));
+ await act(async()=>capture.change?.(capture.editor!.getMarkdown(),false));
+ await waitFor(()=>expect(onSave).toHaveBeenCalled(),{timeout:2500});
+ expect(onSave.mock.calls[0][0]).toContain('## 素材 <img> 进入 HTML');
+ expect(onSave.mock.calls[0][0]).not.toContain('\\<img>');
+});
 it('preserves file margins when real MDX does not emit initial normalization',async()=>{
  const onSave=vi.fn(async(markdown:string)=>({markdown,revision:2}));
  const {container}=render(<MarkdownArtifactEditor markdown={'Old plain\n'} sourceRevision={1} onSave={onSave} />);

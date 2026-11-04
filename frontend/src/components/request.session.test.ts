@@ -1,15 +1,19 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import axios, { AxiosError, type InternalAxiosRequestConfig } from 'axios';
-import { AgentAppsAuth } from './auth';
+import { AgentAppsAuth } from '@/components/auth';
 import { axiosInstance } from './request';
+const mocks = vi.hoisted(() => ({ clearSession: vi.fn() }));
 vi.mock('antd', () => ({ message: { error: vi.fn(), warning: vi.fn() } }));
-vi.mock('@/i18n', () => ({ default: { t: (s: string) => s, language: 'en' } }));
-vi.mock('@/runtime/assistantSession', () => ({ clearLocalAssistantSession: vi.fn() }));
+vi.mock('@/i18n', () => ({ default: { t: (s: string) => s, exists: () => false, language: 'en' } }));
+vi.mock('@/runtime/assistantSession', () => ({ clearLocalAssistantSession: mocks.clearSession }));
 vi.mock('@/runtime/localSession', () => ({ isLocalSessionEnabled: () => false, localSessionInitialized: true, ensureLocalSession: vi.fn(), restoreLocalSessionAndGetToken: vi.fn() }));
 const user = (id: string) => ({ username: id, userId: id, tenantId: id, token: id, refreshToken: id + '-refresh' });
 const tick = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
 const unauthorized = (config: InternalAxiosRequestConfig) => new AxiosError('expired', 'ERR_BAD_REQUEST', config, {}, { status: 401, statusText: '', headers: {}, config, data: {} });
-beforeEach(() => { localStorage.clear(); });
+beforeEach(() => {
+  localStorage.clear();
+  mocks.clearSession.mockReset();
+});
 afterEach(() => vi.restoreAllMocks());
 it('late unauthorized response cannot log out a replacement account', async () => {
   AgentAppsAuth.setUserInfo(user('A'));
@@ -22,6 +26,21 @@ it('late unauthorized response cannot log out a replacement account', async () =
   fail(); await result;
   expect(logout).not.toHaveBeenCalled();
   expect(AgentAppsAuth.getUserInfo()?.userId).toBe('B');
+});
+it('automatic authentication failure invalidates only the browser session', async () => {
+  AgentAppsAuth.setUserInfo(user('A'));
+  const invalidateBrowserSession = vi
+    .spyOn(AgentAppsAuth, 'invalidateBrowserSession')
+    .mockImplementation(() => undefined);
+  axiosInstance.defaults.adapter = async config => {
+    (config as InternalAxiosRequestConfig & { _retry?: boolean })._retry = true;
+    throw unauthorized(config);
+  };
+
+  await axiosInstance.get('/protected').catch(error => error);
+
+  expect(invalidateBrowserSession).toHaveBeenCalledOnce();
+  expect(mocks.clearSession).not.toHaveBeenCalled();
 });
 it('concurrent account refreshes never share a global retry token or log out the new account', async () => {
   const pending: Record<string, (value: unknown) => void> = {};

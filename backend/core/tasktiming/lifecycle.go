@@ -86,6 +86,8 @@ func SyncWorkflow(ctx context.Context, db *gorm.DB, sessionID string, now time.T
 		session.Status = "waiting_approval"
 	case "failed":
 		session.Status = "failed"
+	case "interrupted":
+		session.Status = "interrupted"
 	}
 	return BindWorkflow(ctx, db, session, now)
 }

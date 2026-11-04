@@ -13,6 +13,8 @@ import (
 	workflowattempt "lazymind/core/workflow/attempt"
 	"lazymind/core/workflow/controlpolicy"
 	"lazymind/core/workflow/controlstore"
+	"lazymind/core/workflow/displaystate"
+	"lazymind/core/workflow/graphengine"
 )
 
 func hostControlFixture(t *testing.T) (WorkflowControlService, WorkflowHostIdentity) {
@@ -62,6 +64,97 @@ func TestHostBindingCannotTransferDriverOrClearPendingReview(t *testing.T) {
 	}
 	_, err = svc.Bind(context.Background(), "owner", "run", WorkflowHostBindingRequest{ConnectorID: id.ConnectorID, Credential: id.Credential, Provider: "deepseek-harness", DriverSessionID: "other"})
 	expectControlCode(t, err, "BINDING_CONFLICT")
+}
+
+func TestConfirmAndContinuePublishesOnlyFinalHandoffSnapshot(t *testing.T) {
+	db, graphHash := setupBatchTransitionSession(t)
+	if err := db.AutoMigrate(&orm.WorkflowReviewCheckpoint{}, &orm.WorkflowHostAction{}, &orm.WorkflowCommand{}, &orm.TaskExecutionTiming{}, &orm.TaskAttemptTiming{}); err != nil {
+		t.Fatal(err)
+	}
+	graph := graphengine.CompiledStateGraph{SchemaVersion: graphengine.SchemaVersion, GraphHash: graphHash, StartRoute: "all",
+		Nodes: map[string]graphengine.CompiledNode{
+			"page_prompts": {ID: "page_prompts", Mode: "human", Route: "all"},
+			"generate_ppt": {ID: "generate_ppt", Route: "all"},
+		},
+		ControlEdges: []graphengine.CompiledEdge{
+			{ID: "start", From: "__start__", To: "page_prompts"},
+			{ID: "next", From: "page_prompts", To: "generate_ppt"},
+			{ID: "end", From: "generate_ppt", To: "__end__"},
+		},
+	}
+	if err := db.Model(&orm.WorkflowRevision{}).Where("id = ?", "batch-revision").Update("compiled_graph", graph.JSON()).Error; err != nil {
+		t.Fatal(err)
+	}
+	binding, err := json.Marshal(controlstore.Binding{Required: true, Provider: "deepseek-harness", ConnectorID: "connector", DriverSession: "driver", CredentialHash: controlstore.Hash([]byte("credential"))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&orm.WorkflowSession{}).Where("id = ?", "batch-session").Updates(map[string]any{
+		"status": "waiting", "controller_host": "external-agent", "control_protocol": controlpolicy.Protocol, "control_binding_json": string(binding),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	session, err := GetSession(t.Context(), db.DB, "batch-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(-time.Minute)
+	attempt := orm.WorkflowSessionStep{ID: "prompts-attempt", TaskID: "prompts-task", SessionID: session.ID, StepID: "page_prompts", Status: "succeeded", Validity: "effective", Attempt: 1, ReviewRequired: true, CreatedAt: now, UpdatedAt: now}
+	if err := db.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := controlstore.CreateReview(db.DB, *session, attempt, nil); err != nil {
+		t.Fatal(err)
+	}
+	var review orm.WorkflowReviewCheckpoint
+	if err := db.Where("attempt_id = ?", attempt.ID).First(&review).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Where("session_id = ?", session.ID).Delete(&orm.WorkflowEvent{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	command := WorkflowControlCommand{CommandID: "approve-next", Kind: "confirm_and_continue", ReviewID: review.ID, ReviewVersion: review.Version, ManifestHash: review.ManifestHash, StateVersion: session.StateVersion}
+	result, err := (WorkflowControlService{DB: db.DB}).Execute(t.Context(), session.CreateUserID, session.ID, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Receipt.ActionID == "" {
+		t.Fatalf("continuation was not created: %+v", result)
+	}
+	var events []orm.WorkflowEvent
+	if err := db.Where("session_id = ? AND event_type = ?", session.ID, "workflow.snapshot").Order("id ASC").Find(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("published %d snapshots, want one final snapshot", len(events))
+	}
+	var payload struct {
+		Display displaystate.View `json:"display"`
+	}
+	if err := json.Unmarshal(events[0].PayloadJSON, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Display.Status != "running" || payload.Display.Reason != "preparing" {
+		t.Fatalf("published transient display: %+v", payload.Display)
+	}
+	if events[0].StateVersion != result.Control.StateVersion {
+		t.Fatalf("snapshot version=%d control version=%d", events[0].StateVersion, result.Control.StateVersion)
+	}
+	var eventCount int64
+	if err := db.Model(&orm.WorkflowEvent{}).Where("session_id = ?", session.ID).Count(&eventCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	replay, err := (WorkflowControlService{DB: db.DB}).Execute(t.Context(), session.CreateUserID, session.ID, command)
+	if err != nil || replay.Receipt != result.Receipt {
+		t.Fatalf("idempotent replay diverged: %+v err=%v", replay, err)
+	}
+	var replayEventCount int64
+	if err := db.Model(&orm.WorkflowEvent{}).Where("session_id = ?", session.ID).Count(&replayEventCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if replayEventCount != eventCount {
+		t.Fatalf("idempotent replay added events: before=%d after=%d", eventCount, replayEventCount)
+	}
 }
 func TestHostDeliveryUnknownDoesNotResendAndReconcilesExactReceipt(t *testing.T) {
 	svc, id := hostControlFixture(t)

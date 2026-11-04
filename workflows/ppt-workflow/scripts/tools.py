@@ -61,6 +61,7 @@ from lazymind.chat.engine.subagent.tools import (
     _resolve_artifact_text,
     _save_artifact,
     _workflow_client,
+    save_artifacts,
 )
 from lazymind.chat.engine.tools.multimodal import image_generator
 from lazymind.chat.service.utils.static_file_url import (
@@ -117,6 +118,102 @@ def _normalize_style_flow(value: Any) -> str:
 
 def _ppt_mode_from_style_flow(style_flow: Any) -> str:
     return 'standard' if _normalize_style_flow(style_flow) == 'preview_choice' else 'fast'
+
+
+def ppt_publish_requirement_analysis(
+    requirement_analysis: str,
+    style_flow: str,
+    generate_background_images: str,
+    skip_material_collection: bool,
+) -> dict[str, Any]:
+    """Publish semantic PPT choices and their derived control markers together.
+
+    ``style_flow`` and ``generate_background_images`` are the user-owned business
+    decisions.  Capability and skip markers are deterministic projections owned
+    by this package tool, not additional decisions for the model to reproduce.
+    """
+    if not isinstance(requirement_analysis, str) or not requirement_analysis.strip():
+        raise ToolExecutionError('requirement_analysis must be non-empty')
+    analysis = requirement_analysis.strip()
+
+    style = style_flow.strip() if isinstance(style_flow, str) else ''
+    if style not in {'auto', 'preview_choice'}:
+        raise ToolExecutionError(
+            'style_flow must be exactly auto or preview_choice'
+        )
+
+    backgrounds = (
+        generate_background_images.strip()
+        if isinstance(generate_background_images, str) else ''
+    )
+    if backgrounds not in {'enabled', 'disabled'}:
+        raise ToolExecutionError(
+            'generate_background_images must be exactly enabled or disabled'
+        )
+    if not isinstance(skip_material_collection, bool):
+        raise ToolExecutionError('skip_material_collection must be a boolean')
+
+    artifacts: list[dict[str, Any]] = [
+        {
+            'key': 'requirement_analysis',
+            'content_type': 'text',
+            'value': analysis,
+            'source_tool': 'ppt_publish_requirement_analysis',
+        },
+        {
+            'key': 'ppt_capability_requirements',
+            'content_type': 'text',
+            'value': f'AI_BACKGROUND_IMAGES: {backgrounds}',
+            'source_tool': 'ppt_publish_requirement_analysis',
+        },
+        {
+            'key': 'style_flow',
+            'content_type': 'text',
+            'value': style,
+            'source_tool': 'ppt_publish_requirement_analysis',
+        },
+        {
+            'key': 'generate_background_images',
+            'content_type': 'text',
+            'value': backgrounds,
+            'source_tool': 'ppt_publish_requirement_analysis',
+        },
+    ]
+    if style == 'auto':
+        artifacts.append({
+            'key': 'skip_style_choices',
+            'content_type': 'text',
+            'value': 'skip',
+            'source_tool': 'ppt_publish_requirement_analysis',
+        })
+    if backgrounds == 'disabled':
+        artifacts.append({
+            'key': 'skip_background_images',
+            'content_type': 'text',
+            'value': 'skip',
+            'source_tool': 'ppt_publish_requirement_analysis',
+        })
+    if skip_material_collection:
+        artifacts.append({
+            'key': 'skip_material_collection',
+            'content_type': 'text',
+            'value': 'skip',
+            'source_tool': 'ppt_publish_requirement_analysis',
+        })
+
+    saved = save_artifacts(artifacts)
+    if not isinstance(saved, dict) or saved.get('status') != 'ok':
+        raise ToolExecutionError(
+            f'failed to publish PPT requirement analysis: {saved!r}'
+        )
+    return {
+        'status': 'ok',
+        'style_flow': style,
+        'generate_background_images': backgrounds,
+        'skip_material_collection': skip_material_collection,
+        'saved_artifacts': [artifact['key'] for artifact in artifacts],
+        'saved_count': saved.get('saved_count', len(artifacts)),
+    }
 
 
 def check_ppt_workflow_capabilities(
@@ -1086,6 +1183,35 @@ def _write_json_atomic(path: Path, value: Any) -> None:
     os.replace(tmp, path)
 
 
+def _normalize_use_image_value(value: Any) -> list[dict[str, Any]]:
+    """Use one canonical ordered representation while accepting legacy objects."""
+    if value in (None, [], False, True):
+        return []
+    items = [value] if isinstance(value, dict) else value
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ValueError('use_image must be an object or ordered array of objects')
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        keys = set(item)
+        if keys == {'reference_image_index'}:
+            index = item.get('reference_image_index')
+            if type(index) is not int or index < 0:
+                raise ValueError('reference_image_index must be a non-negative integer')
+            normalized.append({'reference_image_index': index})
+        elif keys == {'doc_index', 'image_index'}:
+            doc_index = item.get('doc_index')
+            image_index = item.get('image_index')
+            if (
+                type(doc_index) is not int or doc_index < 0
+                or type(image_index) is not int or image_index < 0
+            ):
+                raise ValueError('doc_index and image_index must be non-negative integers')
+            normalized.append({'doc_index': doc_index, 'image_index': image_index})
+        else:
+            raise ValueError('each use_image item must identify exactly one image pool')
+    return normalized
+
+
 def _parse_inserted_outline_page(page_json: Union[str, dict, None]) -> dict[str, Any]:
     if isinstance(page_json, str):
         try:
@@ -1105,14 +1231,9 @@ def _parse_inserted_outline_page(page_json: Union[str, dict, None]) -> dict[str,
         if field in page and not isinstance(page[field], list):
             raise ValueError(f'page_json.{field} must be a list')
         page.setdefault(field, [])
-    # Models sometimes use a boolean to express whether a page should contain
-    # an image/table. The renderer needs a concrete reference object here;
-    # treating True as one later raises ``argument of type bool is not
-    # iterable`` while resolving reference_image_index/doc_index. A boolean
-    # carries no usable binding, so normalize it to no inherited asset.
-    for field in ('use_image', 'use_table'):
-        if page.get(field) is not None and not isinstance(page.get(field), dict):
-            page[field] = None
+    page['use_image'] = _normalize_use_image_value(page.get('use_image'))
+    if page.get('use_table') is not None and not isinstance(page.get('use_table'), dict):
+        page['use_table'] = None
     return page
 
 
@@ -2067,7 +2188,7 @@ def _format_slide_outline_brief(page: dict) -> str:
             lines.append(f'{p["index"]}. ' + ' · '.join(x for x in bits if x))
 
     use_image = view.get('use_image')
-    if isinstance(use_image, dict) and use_image:
+    if isinstance(use_image, (dict, list)) and use_image:
         lines.append('')
         lines.append(f'配图：{json.dumps(use_image, ensure_ascii=False)}')
     use_table = view.get('use_table')
@@ -2427,7 +2548,7 @@ def _parse_slide_outline_brief(text: str, fallback: dict, page_no: int) -> dict:
         'visual_hints': '',
         'bullets': [],
         'data_points': [],
-        'use_image': None,
+        'use_image': [],
         'use_table': None,
     })
     field_labels = {
@@ -2491,6 +2612,7 @@ def _parse_slide_outline_brief(text: str, fallback: dict, page_no: int) -> dict:
         page['narrative'] = '\n'.join(([existing] if existing else []) + extra_narrative)
     page['page_kind'] = _coerce_str(page.get('page_kind')) or 'content'
     page['title'] = _coerce_str(page.get('title')) or f'第 {page_no} 页'
+    page['use_image'] = _normalize_use_image_value(page.get('use_image'))
     return page
 
 
@@ -4121,6 +4243,10 @@ def _stage_tool_result(stage_name: str, payload: dict) -> dict:
 
 _MATERIAL_DIR_NAME = 'material_images'
 _MATERIAL_MANIFEST = 'manifest.json'
+_SOURCE_BUNDLE_DIR_NAME = 'source_bundles'
+_SOURCE_CONTEXT_MAX_CHARS = 24_000
+_SOURCE_READ_PAGE_MAX_CHARS = 24_000
+_SOURCE_IMAGE_RETRY_LIMIT = 2
 _IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp')
 _PPT_BACKGROUND_PIXEL_SIZE = (1280, 720)
 _DOWNLOAD_TIMEOUT = 25
@@ -4133,6 +4259,12 @@ _IMAGE_URL_KEYS = (
 
 def _material_root() -> Path:
     root = _conversation_root() / _MATERIAL_DIR_NAME
+    # External workflow attempts may not have a stable conversation id.  Keep
+    # their material inventories scoped to the durable workflow session so a
+    # previous run cannot make a later run appear to have imported its images.
+    session_id = _workflow_session_id()
+    if session_id:
+        root = root / hashlib.sha256(session_id.encode()).hexdigest()[:16]
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -4161,6 +4293,1631 @@ def _write_material_manifest(data: dict) -> Path:
     path = _material_manifest_path()
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
     return path
+
+
+def _workflow_input_value(slot: str) -> Any:
+    """Return one immutable Workflow input value from the current Attempt."""
+    try:
+        remote_inputs = require_context().params.get('remote_inputs') or {}
+    except Exception:
+        return None
+    return remote_inputs.get(slot) if isinstance(remote_inputs, dict) else None
+
+
+def _json_input_value(value: Any) -> dict[str, Any]:
+    """Normalize current JSON-value transport and older path/string transports."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    raw = value.strip()
+    path = Path(raw)
+    if path.is_file():
+        try:
+            raw = path.read_text(encoding='utf-8')
+        except OSError:
+            return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(parsed, dict) and isinstance(parsed.get('data'), dict):
+        return parsed['data']
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _flatten_writer_blocks(blocks: Any) -> list[dict[str, Any]]:
+    ordered: list[dict[str, Any]] = []
+
+    def visit(items: Any) -> None:
+        for block in items if isinstance(items, list) else []:
+            if not isinstance(block, dict):
+                continue
+            binding = block.get('provider_binding') or {}
+            ordered.append({
+                'block_id': _coerce_str(block.get('node_id')),
+                'source_block_id': _coerce_str(binding.get('block_id')),
+                'type': _coerce_str(block.get('type'), 'paragraph'),
+                'text': _coerce_str(block.get('content')),
+            })
+            visit(block.get('children'))
+
+    visit(blocks)
+    return ordered
+
+
+_SOURCE_REQUIREMENT_RE = re.compile(
+    r'(?:要求|需求|必须|务必|应当|需要(?:包含|使用|保留|呈现|体现|覆盖)|不得|不要|'
+    r'禁止|约束|规范|注意事项|请(?:基于|使用|保留|制作|生成|输出)|'
+    r'(?:PPT|演示|制作).{0,6}(?:说明|需求|要求)|'
+    r'(?:页面|内容|视觉|素材).{0,4}(?:要求|说明|规范)|'
+    r'(?:页数|页面数量|风格|配色|字体|目标受众|受众|交付物?|输出格式|引用要求|'
+    r'数据来源)\s*[:：]|(?:共|总计|制作|做成|控制在)\s*\d+\s*页|'
+    r'\b(?:requirements?|required|must|should|need to|do not|constraints?|deliverables?)\b)',
+    re.IGNORECASE,
+)
+
+
+def _source_heading(block: dict[str, Any]) -> bool:
+    block_type = _coerce_str(block.get('type')).lower()
+    text = _coerce_str(block.get('text')).strip()
+    return 'heading' in block_type or block_type in {'title', 'header'} or text.startswith('#')
+
+
+def _source_block_view(block: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'block_id': block.get('block_id'),
+        'source_block_id': block.get('source_block_id'),
+        'type': block.get('type'),
+        'text': _coerce_str(block.get('text')).strip(),
+    }
+
+
+def _presentation_contract(
+    blocks: list[dict[str, Any]],
+    text_hash: str,
+    *,
+    title: str = '',
+) -> dict[str, Any]:
+    """Build a cheap, complete requirement scan without treating body text as requirements."""
+    direct = {
+        index for index, block in enumerate(blocks)
+        if block.get('text') and _SOURCE_REQUIREMENT_RE.search(str(block['text']))
+    }
+    selected = set(direct)
+    for index in sorted(direct):
+        # Keep the nearest heading so an isolated bullet retains its section meaning.
+        for previous in range(index - 1, -1, -1):
+            if _source_heading(blocks[previous]):
+                selected.add(previous)
+                break
+        # A requirement heading commonly owns a following bullet/list group.
+        if _source_heading(blocks[index]) or _coerce_str(blocks[index].get('text')).rstrip().endswith(('：', ':')):
+            for following in range(index + 1, len(blocks)):
+                if _source_heading(blocks[following]):
+                    break
+                if _coerce_str(blocks[following].get('text')).strip():
+                    selected.add(following)
+
+    requirement_blocks = [
+        _source_block_view(blocks[index]) for index in sorted(selected)
+        if _coerce_str(blocks[index].get('text')).strip()
+    ]
+
+    concept_indices: list[int] = []
+    for index, block in enumerate(blocks):
+        if _source_heading(block) or len(concept_indices) < 3:
+            if _coerce_str(block.get('text')).strip():
+                concept_indices.append(index)
+    nonempty_indices = [
+        index for index, block in enumerate(blocks)
+        if _coerce_str(block.get('text')).strip()
+    ]
+    if nonempty_indices:
+        concept_indices.append(nonempty_indices[-1])
+    concept_blocks: list[dict[str, Any]] = []
+    concept_chars = 0
+    for index in dict.fromkeys(concept_indices):
+        view = _source_block_view(blocks[index])
+        if concept_chars + len(view['text']) > 6_000 and concept_blocks:
+            break
+        concept_blocks.append(view)
+        concept_chars += len(view['text'])
+    return {
+        'source_is_authoritative': True,
+        'source_text_sha256': text_hash,
+        'scan_coverage': {
+            'all_blocks_scanned': True,
+            'block_count': len(blocks),
+            'explicit_requirements_found': bool(direct),
+        },
+        'requirements': requirement_blocks,
+        'concept': {
+            'title': title,
+            'blocks': concept_blocks,
+        },
+        'rules': [
+            'Preserve explicit source requirements and factual claims.',
+            'Keep source-image identity, order and reuse instructions.',
+            'Fail visibly when a required source image is unavailable.',
+        ],
+    }
+
+
+_REQUIREMENT_PAGE_RE = re.compile(
+    r'(?:第\s*(\d+)\s*页|\bpage\s*(\d+)\b|\bP\s*(\d+)\b)', re.IGNORECASE,
+)
+_REQUIREMENT_CLAUSE_SPLIT_RE = re.compile(r'(?<=[。！？!?；;])|\n+')
+_REQUIREMENT_CATEGORIES = frozenset({
+    'content', 'visual', 'format', 'asset', 'data', 'editability', 'delivery',
+})
+
+
+def _requirement_scope(text: str) -> dict[str, Any]:
+    match = _REQUIREMENT_PAGE_RE.search(text)
+    if match:
+        return {
+            'kind': 'page',
+            'page_no': int(match.group(1) or match.group(2) or match.group(3)),
+        }
+    return {'kind': 'deck'}
+
+
+def _requirement_category(text: str) -> str:
+    lowered = text.lower()
+    checks = (
+        ('editability', ('可编辑', 'editable')),
+        ('delivery', ('交付', '导出', 'pptx', 'pdf', 'download')),
+        ('asset', ('图片', '图像', '照片', '素材', '配图', 'image', 'photo')),
+        ('data', ('数据', '数值', '来源', '引用', '口径', 'data', 'citation')),
+        ('format', ('页数', '页面数量', '比例', '16:9', '4:3', '中文', '英文', 'language')),
+        ('visual', ('风格', '配色', '颜色', '色号', '字体', '字号', '边距', '留白',
+                    '背景', '版式', '视觉', 'color', 'font', 'margin', 'style')),
+    )
+    for category, markers in checks:
+        if any(marker in lowered for marker in markers):
+            return category
+    return 'content'
+
+
+def _requirement_stages(category: str) -> list[str]:
+    if category == 'visual':
+        return ['style', 'page', 'final']
+    if category in {'format', 'content', 'asset', 'data'}:
+        return ['outline', 'page', 'final']
+    if category == 'editability':
+        return ['page', 'final']
+    if category == 'delivery':
+        return ['final']
+    return ['style', 'outline', 'page', 'final']
+
+
+def _requirement_entry(
+    raw_text: str,
+    *,
+    source: str,
+    priority: int,
+    source_ref: str = '',
+    value: Any = None,
+    key: str = '',
+    scope: Optional[dict[str, Any]] = None,
+    category: str = '',
+    strength: str = 'hard',
+) -> dict[str, Any]:
+    text = _coerce_str(raw_text).strip()
+    resolved_category = category if category in _REQUIREMENT_CATEGORIES else _requirement_category(text)
+    resolved_scope = scope if isinstance(scope, dict) else _requirement_scope(text)
+    identity = json.dumps({
+        'source': source,
+        'source_ref': source_ref,
+        'raw_text': text,
+        'scope': resolved_scope,
+        'category': resolved_category,
+        'key': key,
+        'value': value,
+    }, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    entry = {
+        'id': 'req_' + hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16],
+        'source': source,
+        'source_ref': source_ref or None,
+        'priority': priority,
+        'strength': 'soft' if strength == 'soft' else 'hard',
+        'scope': resolved_scope,
+        'category': resolved_category,
+        'raw_text': text,
+        'applies_to': _requirement_stages(resolved_category),
+    }
+    if key:
+        entry['key'] = key
+    if value is not None:
+        entry['value'] = value
+    return entry
+
+
+def _normalize_source_requirement_scope(raw: Any, text: str) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        kind = _coerce_str(raw.get('kind')).lower()
+        if kind == 'page':
+            page_no = _coerce_int(raw.get('page_no'), 0, lo=0)
+            if page_no > 0:
+                return {'kind': 'page', 'page_no': page_no}
+        if kind == 'deck':
+            return {'kind': 'deck'}
+    return _requirement_scope(text)
+
+
+def _normalize_source_requirements(
+    raw: Any,
+    *,
+    source_prefix: str = 'uploaded_source',
+) -> list[dict[str, Any]]:
+    """Validate one complete, structured source-requirement list."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ToolExecutionError(f'source_requirements_json must be valid JSON: {exc}')
+    if isinstance(raw, dict):
+        raw = raw.get('requirements')
+    if not isinstance(raw, list):
+        raise ToolExecutionError('source_requirements_json must be a JSON list')
+
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(raw, start=1):
+        if isinstance(item, str):
+            item = {'text': item}
+        if not isinstance(item, dict):
+            raise ToolExecutionError(
+                f'source requirement {index} must be a string or object'
+            )
+        text = _coerce_str(item.get('text') or item.get('raw_text')).strip()
+        if not text:
+            raise ToolExecutionError(f'source requirement {index} has empty text')
+        scope = _normalize_source_requirement_scope(item.get('scope'), text)
+        category = _coerce_str(item.get('category')).lower()
+        if category and category not in _REQUIREMENT_CATEGORIES:
+            raise ToolExecutionError(
+                f'source requirement {index} has unsupported category {category!r}'
+            )
+        record = {
+            'text': text,
+            'source_ref': _coerce_str(
+                item.get('source_ref') or item.get('source_block_id')
+                or item.get('block_id') or f'{source_prefix}:{index}'
+            ),
+            'scope': scope,
+            'category': category or _requirement_category(text),
+            'strength': 'soft' if item.get('strength') == 'soft' else 'hard',
+        }
+        normalized.append(record)
+    return normalized
+
+
+def _source_requirements_payload(requirements: list[dict[str, Any]]) -> dict[str, Any]:
+    canonical = json.dumps(
+        requirements, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+    )
+    return {
+        'version': 1,
+        'requirements': requirements,
+        'sha256': hashlib.sha256(canonical.encode('utf-8')).hexdigest(),
+    }
+
+
+def _requirement_summary_line(item: dict[str, Any]) -> str:
+    source = {
+        'direct_user': '用户输入',
+        'source_document': '源材料',
+        'selected_choice': '已确认选项',
+    }.get(_coerce_str(item.get('source')), '其他输入')
+    source_ref = _coerce_str(item.get('source_ref'))
+    provenance = f'{source} · {source_ref}' if source_ref else source
+    return f'- {_coerce_str(item.get("raw_text"))}（来源：{provenance}）'
+
+
+def _format_requirement_contract_summary(contract: dict[str, Any]) -> str:
+    """Render the frozen contract for the existing page-prompt approval."""
+    requirements = [
+        item for item in (contract.get('requirements') or [])
+        if isinstance(item, dict) and _coerce_str(item.get('raw_text'))
+    ]
+    lines = [
+        '# 完整需求契约',
+        '',
+        '以下要求与页面提示词来自同一份冻结契约；页面生成不得以默认值覆盖。',
+    ]
+    global_items = [
+        item for item in requirements
+        if (item.get('scope') or {}).get('kind', 'deck') != 'page'
+    ]
+    page_items: dict[int, list[dict[str, Any]]] = {}
+    for item in requirements:
+        scope = item.get('scope') or {}
+        if scope.get('kind') != 'page':
+            continue
+        page_no = _coerce_int(scope.get('page_no'), 0, lo=0)
+        if page_no > 0:
+            page_items.setdefault(page_no, []).append(item)
+
+    if global_items:
+        lines.extend(['', '## 全局要求'])
+        for item in global_items:
+            lines.append(_requirement_summary_line(item))
+    for page_no in sorted(page_items):
+        lines.extend(['', f'## 第 {page_no} 页要求'])
+        for item in page_items[page_no]:
+            lines.append(_requirement_summary_line(item))
+    return '\n'.join(lines).strip()
+
+
+def _publish_requirement_contract_summary(deck: Path) -> dict[str, Any]:
+    contract = _ensure_requirement_contract(deck)
+    summary = _format_requirement_contract_summary(contract)
+    saved = _save_artifact(
+        key='requirement_contract_summary',
+        content_type='text',
+        value=summary,
+        source_tool='ppt_publish_outline',
+        internal_publish=True,
+    )
+    if _tool_failed(saved):
+        raise ToolExecutionError(
+            'requirement contract summary could not be published: '
+            f'{_tool_fail_reason(saved)}'
+        )
+    return {
+        'requirement_count': len(contract.get('requirements') or []),
+        'chars': len(summary),
+    }
+
+
+def _validate_required_source_images(bundle: dict[str, Any]) -> None:
+    """Prevent the terminal material publisher from hiding a skipped import."""
+    expected = _coerce_int(
+        bundle.get('source_image_occurrence_count', bundle.get('source_image_count')),
+        0,
+        lo=0,
+    )
+    if expected == 0 or bundle.get('source_images_required') is not True:
+        return
+    version = _coerce_str(bundle.get('version'))
+    manifest = _load_material_manifest()
+    receipt = manifest.get('source_import') or {}
+    source_entries = [
+        item for item in manifest.get('images') or []
+        if isinstance(item, dict)
+        and item.get('source_type') == 'source_document'
+        and _coerce_str(item.get('source_version')) == version
+    ]
+    problems: list[str] = []
+    if _coerce_str(receipt.get('source_version')) != version:
+        problems.append('no matching source-image import receipt')
+    if _coerce_int(receipt.get('occurrence_count'), -1) != expected:
+        problems.append('image occurrence count was not confirmed')
+    if _coerce_int(receipt.get('ready_occurrence_count'), -1) != expected:
+        problems.append('one or more image occurrences are still missing')
+    if receipt.get('complete') is not True:
+        problems.append('source-image import is incomplete')
+    unique_count = _coerce_int(receipt.get('unique_asset_count'), -1)
+    if unique_count < 1 or len(source_entries) != unique_count:
+        problems.append('unique source-image inventory is incomplete')
+    if _coerce_int(receipt.get('published_unique_count'), -1) != unique_count:
+        problems.append('not every unique source image was published')
+    missing_files = [
+        _coerce_str(item.get('asset_id')) or _coerce_str(item.get('path'))
+        for item in source_entries
+        if not Path(_coerce_str(item.get('path'))).is_file()
+    ]
+    if missing_files:
+        problems.append('staged source image files are unavailable')
+    if problems:
+        raise ToolExecutionError(
+            'required source images were not completely materialized; '
+            + '; '.join(problems)
+        )
+
+
+def ppt_publish_material_summary(
+    material_summary: str,
+    source_requirements_json: Union[str, list, dict, None] = None,
+) -> dict[str, Any]:
+    """Atomically publish the human material summary and complete source requirements.
+
+    ``source_requirements_json`` contains every explicit requirement discovered in
+    uploaded/attached source files.  Requirements already frozen in a provider
+    source bundle are merged automatically so every source path uses one transport.
+    """
+    summary = _coerce_str(material_summary).strip()
+    if not summary:
+        raise ToolExecutionError('material_summary must be non-empty')
+
+    provided_requirements = _normalize_source_requirements(source_requirements_json)
+    bundle = _json_input_value(_workflow_input_value('source_bundle'))
+    _validate_required_source_images(bundle)
+    presentation_contract = bundle.get('presentation_contract') or {}
+    bundled = _normalize_source_requirements(
+        presentation_contract.get('requirements') or [],
+        source_prefix='source_document',
+    )
+    bundled_occurrences = {
+        json.dumps({
+            'text': item['text'],
+            'source_ref': item['source_ref'],
+            'scope': item['scope'],
+        }, ensure_ascii=False, sort_keys=True)
+        for item in bundled
+    }
+    requirements = [*bundled]
+    for item in provided_requirements:
+        occurrence = json.dumps({
+            'text': item['text'],
+            'source_ref': item['source_ref'],
+            'scope': item['scope'],
+        }, ensure_ascii=False, sort_keys=True)
+        # The frozen provider contract is auto-injected above. Ignore only the
+        # exact same occurrence if a caller also copied that transport record.
+        if occurrence not in bundled_occurrences:
+            requirements.append(item)
+    payload = _source_requirements_payload(requirements)
+    artifacts = [
+        {
+            'key': 'material_summary',
+            'content_type': 'text',
+            'value': summary,
+            'source_tool': 'ppt_publish_material_summary',
+        },
+        {
+            'key': 'source_requirements',
+            'content_type': 'json',
+            'value': payload,
+            'source_tool': 'ppt_publish_material_summary',
+        },
+    ]
+    saved = save_artifacts(artifacts)
+    if not isinstance(saved, dict) or saved.get('status') != 'ok':
+        raise ToolExecutionError(
+            f'failed to publish PPT materials and source requirements: {saved!r}'
+        )
+    return {
+        'status': 'ok',
+        'source_requirement_count': len(requirements),
+        'source_requirements_sha256': payload['sha256'],
+        'saved_artifacts': [artifact['key'] for artifact in artifacts],
+        'saved_count': saved.get('saved_count', len(artifacts)),
+    }
+
+
+def _build_requirement_contract(
+    task_pack: dict[str, Any],
+    info_pack: dict[str, Any],
+    source_requirements: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Freeze explicit requirements already read by the workflow into one contract.
+
+    This is deliberately deterministic and does not reread the source document or
+    call a model. Unknown wording is retained verbatim instead of being discarded
+    merely because the code cannot classify it.
+    """
+    requirements: list[dict[str, Any]] = []
+    direct_query = _coerce_str(
+        info_pack.get('original_user_query') or info_pack.get('user_query'),
+    )
+    clauses = [
+        clause.strip() for clause in _REQUIREMENT_CLAUSE_SPLIT_RE.split(direct_query)
+        if clause.strip()
+    ]
+    for index, clause in enumerate(clauses):
+        requirements.append(_requirement_entry(
+            clause,
+            source='direct_user',
+            source_ref=f'user_query:{index + 1}',
+            priority=400,
+        ))
+
+    style_hint = _coerce_str(
+        (task_pack.get('params') or {}).get('style_hint')
+        or info_pack.get('style_hint'),
+    )
+    if style_hint and style_hint not in direct_query:
+        requirements.append(_requirement_entry(
+            style_hint,
+            source='direct_user',
+            source_ref='style_hint',
+            priority=400,
+            key='style_hint',
+            value=style_hint,
+        ))
+
+    structured_source = source_requirements or {}
+    structured_requirements = structured_source.get('requirements') or []
+    for index, block in enumerate(structured_requirements):
+        if not isinstance(block, dict):
+            continue
+        text = _coerce_str(block.get('text') or block.get('raw_text')).strip()
+        if not text:
+            continue
+        requirements.append(_requirement_entry(
+            text,
+            source='source_document',
+            source_ref=_coerce_str(
+                block.get('source_ref') or f'structured_source_requirement:{index + 1}'
+            ),
+            priority=300,
+            scope=_normalize_source_requirement_scope(block.get('scope'), text),
+            category=_coerce_str(block.get('category')).lower(),
+            strength=_coerce_str(block.get('strength'), 'hard').lower(),
+        ))
+
+    # Legacy decks may have only document_digest. Once source_requirements exists,
+    # it is the canonical transport and already includes that frozen document
+    # contract, so reading both channels would duplicate the same occurrence.
+    if not structured_requirements:
+        presentation_contract = (
+            (info_pack.get('document_digest') or {}).get('presentation_contract') or {}
+        )
+        if presentation_contract.get('source_is_authoritative') is True:
+            for index, block in enumerate(
+                presentation_contract.get('requirements') or [], start=1,
+            ):
+                if not isinstance(block, dict):
+                    continue
+                text = _coerce_str(block.get('text')).strip()
+                if not text:
+                    continue
+                requirements.append(_requirement_entry(
+                    text,
+                    source='source_document',
+                    source_ref=_coerce_str(
+                        block.get('source_block_id') or block.get('block_id')
+                        or f'source_requirement:{index}',
+                    ),
+                    priority=300,
+                ))
+
+    params = task_pack.get('params') or {}
+    page_count = _coerce_int(params.get('page_count'), 0, lo=0)
+    if page_count:
+        requirements.append(_requirement_entry(
+            f'页面数量：{page_count} 页',
+            source='selected_choice',
+            source_ref='task_pack.params.page_count',
+            priority=200,
+            key='page_count',
+            value=page_count,
+        ))
+    if 'generate_background_images' in params:
+        backgrounds = _coerce_bool(params.get('generate_background_images'))
+        requirements.append(_requirement_entry(
+            '启用 AI 生成背景图' if backgrounds else '不使用 AI 生成背景图',
+            source='selected_choice',
+            source_ref='task_pack.params.generate_background_images',
+            priority=200,
+            key='generate_background_images',
+            value=backgrounds,
+        ))
+
+    # Preserve every occurrence and its provenance. Priority orders application;
+    # it never removes a lower-priority requirement that happens to read similarly.
+    ordered_requirements = sorted(
+        requirements, key=lambda item: -int(item['priority']),
+    )
+
+    return {
+        'version': 2,
+        'immutable': True,
+        'source_requirements_sha256': _coerce_str(structured_source.get('sha256')) or None,
+        'source_requirement_count': len(structured_source.get('requirements') or []),
+        'precedence': [
+            'direct_user', 'source_document', 'selected_choice', 'inference_or_default',
+        ],
+        'rules': [
+            'A lower-priority generated default may fill only unspecified fields.',
+            'A downstream stage may apply, report a conflict, or report '
+            'unsupported; it may not silently omit a hard requirement.',
+            'The contract is derived from already-read inputs and must not trigger a second source-document read.',
+        ],
+        'requirements': ordered_requirements,
+    }
+
+
+def _ensure_requirement_contract(
+    deck: Path,
+    *,
+    allow_source_refresh: bool = False,
+) -> dict[str, Any]:
+    """Create the deck contract, or refresh it only at an explicit rebuild boundary."""
+    info_path = deck / 'info_pack.json'
+    task_path = deck / 'task_pack.json'
+    if not info_path.is_file() or not task_path.is_file():
+        return {}
+    info_pack = json.loads(info_path.read_text(encoding='utf-8'))
+    source_requirements = _json_input_value(_workflow_input_value('source_requirements'))
+    existing = info_pack.get('requirement_contract')
+    if isinstance(existing, dict) and isinstance(existing.get('requirements'), list):
+        current_sha = _coerce_str(source_requirements.get('sha256'))
+        frozen_sha = _coerce_str(existing.get('source_requirements_sha256'))
+        if current_sha and current_sha != frozen_sha:
+            if not allow_source_refresh:
+                raise ToolExecutionError(
+                    'requirement_contract_stale: source requirements changed after '
+                    'the deck contract was frozen; rebuild from build_outline'
+                )
+        else:
+            return existing
+    task_pack = json.loads(task_path.read_text(encoding='utf-8'))
+    contract = _build_requirement_contract(
+        task_pack, info_pack, source_requirements=source_requirements,
+    )
+    info_pack['requirement_contract'] = contract
+    _write_json_atomic(info_path, info_pack)
+    return contract
+
+
+def _source_bundle_root(identity: str) -> Path:
+    root = _conversation_root() / _SOURCE_BUNDLE_DIR_NAME / identity[:16]
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _source_image_snapshot(source_document: dict[str, Any]) -> dict[str, Any]:
+    """Keep only provider image tickets needed for later binary download."""
+    image_blocks: list[dict[str, Any]] = []
+
+    def visit(items: Any) -> None:
+        for block in items if isinstance(items, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if _coerce_str(block.get('type')).lower() == 'image':
+                image_blocks.append({
+                    'node_id': block.get('node_id'),
+                    'type': 'image',
+                    'content': block.get('content') or '',
+                    'stage': block.get('stage') or source_document.get('stage') or 'final',
+                    'provider_binding': block.get('provider_binding') or {},
+                    'provider_payload': block.get('provider_payload') or {},
+                    'editable': block.get('editable', False),
+                    'children': [],
+                })
+            visit(block.get('children'))
+
+    visit(source_document.get('blocks'))
+    return {
+        'document_id': source_document.get('document_id'),
+        'stage': source_document.get('stage') or 'final',
+        'title': source_document.get('title') or '',
+        'revision': source_document.get('revision'),
+        'metadata': source_document.get('metadata') or {},
+        'provider_binding': source_document.get('provider_binding') or {},
+        'blocks': image_blocks,
+    }
+
+
+_ALL_SOURCE_IMAGES_RE = re.compile(
+    r'(?:全部|所有|每(?:一)?(?:张|幅|个))(?:的)?(?:源文档|文档|原文|素材)?'
+    r'(?:中的|内的)?(?:素材)?(?:图片|图像|插图|配图|图)'
+    r'|(?:源文档|文档|原文)(?:中的|内的)?(?:素材)?(?:图片|图像|插图|配图)'
+    r'.{0,16}(?:全部|完整|一张不漏|都要|均需|均要)'
+    r'|(?:all|every)\s+(?:source\s+|document\s+|material\s+)?images?',
+    re.IGNORECASE,
+)
+_SOURCE_IMAGE_NEGATION_RE = re.compile(
+    r'(?:不需要|无需|不用|不要|排除|忽略).{0,12}(?:图片|图像|插图|配图|素材图)'
+    r'|(?:图片|图像|插图|配图|素材图).{0,12}(?:不需要|无需|不用|不要|排除|忽略)',
+)
+
+
+def _source_images_explicitly_required(
+    request: str,
+    presentation_contract: dict[str, Any],
+) -> bool:
+    texts = [_coerce_str(request)]
+    for item in presentation_contract.get('requirements') or []:
+        if isinstance(item, dict):
+            texts.append(_coerce_str(item.get('text')))
+    for text in texts:
+        for clause in re.split(r'[\n。！？!?；;]+', text):
+            if (
+                _ALL_SOURCE_IMAGES_RE.search(clause)
+                and not _SOURCE_IMAGE_NEGATION_RE.search(clause)
+            ):
+                return True
+    return False
+
+
+def _source_occurrence_id(block: dict[str, Any], position: int) -> str:
+    binding = block.get('provider_binding') or {}
+    return _coerce_str(
+        (binding.get('block_id') if isinstance(binding, dict) else '')
+        or block.get('node_id')
+        or f'image-occurrence-{position}'
+    )
+
+
+def _profile_source_resources(media: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    resources: dict[str, dict[str, Any]] = {}
+    for resource in media.get('profile_input_resources') or []:
+        if not isinstance(resource, dict):
+            continue
+        meta = resource.get('meta') or {}
+        semantic_status = _coerce_str(
+            (meta.get('semantic_status') if isinstance(meta, dict) else '')
+            or resource.get('status')
+        ).lower()
+        if semantic_status and semantic_status not in {
+            'ready', 'ok', 'success', 'available', 'materialized',
+        }:
+            continue
+        content_ref = meta.get('content_ref') or {} if isinstance(meta, dict) else {}
+        candidates = [
+            meta.get('provider_block_id') if isinstance(meta, dict) else '',
+            content_ref.get('node_id') if isinstance(content_ref, dict) else '',
+        ]
+        resource_id = _coerce_str(resource.get('resource_id'))
+        if '-image-' in resource_id:
+            candidates.append(resource_id.split('-image-', 1)[1])
+        uri = _coerce_str(resource.get('uri'))
+        match = re.search(r'(?:#|[?&])image=([^&#]+)', uri)
+        if match:
+            candidates.append(match.group(1))
+        for value in candidates:
+            block_id = _coerce_str(value)
+            if block_id:
+                resources[block_id] = resource
+    return resources
+
+
+def _profile_source_block_ids(media: dict[str, Any]) -> set[str]:
+    return set(_profile_source_resources(media))
+
+
+def _source_assets_from_media(
+    media_runs: Union[dict[str, Any], list[dict[str, Any]]],
+    source_document: Optional[dict[str, Any]] = None,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    runs = media_runs if isinstance(media_runs, list) else [media_runs]
+    raw_assets: dict[str, dict[str, Any]] = {}
+    ready_ids: set[str] = set()
+    profiles: dict[str, dict[str, Any]] = {}
+    for media in runs:
+        if not isinstance(media, dict):
+            continue
+        run_profiles = _profile_source_resources(media)
+        profiles.update(run_profiles)
+        ready_ids.update(run_profiles)
+        for asset_id, raw in (((media.get('media_assets') or {}).get('assets') or {}).items()):
+            if isinstance(raw, dict):
+                key = _coerce_str(asset_id)
+                previous = raw_assets.get(key)
+                previous_path = _coerce_str((previous or {}).get('local_path'))
+                if previous is None or not Path(previous_path).is_file():
+                    raw_assets[key] = raw
+
+    assets: list[dict[str, Any]] = []
+    for position, (asset_id, raw) in enumerate(raw_assets.items(), start=1):
+        local_path = _coerce_str(raw.get('local_path'))
+        if not local_path or not Path(local_path).is_file():
+            continue
+        meta = raw.get('meta') or {}
+        content_ref = meta.get('content_ref') or {}
+        source_block_id = _coerce_str(
+            content_ref.get('node_id') if isinstance(content_ref, dict) else ''
+        ) or _coerce_str(meta.get('provider_block_id') if isinstance(meta, dict) else '')
+        if source_block_id:
+            ready_ids.add(source_block_id)
+        assets.append({
+            'asset_id': _coerce_str(asset_id),
+            'order': position,
+            'local_path': str(Path(local_path).resolve()),
+            'caption': _coerce_str(raw.get('caption') or raw.get('summary')),
+            'summary': _coerce_str(raw.get('summary')),
+            'source_block_id': source_block_id,
+            'source_block_ids': [source_block_id] if source_block_id else [],
+            'required': True,
+            'reuse_allowed': True,
+        })
+
+    if isinstance(source_document, dict):
+        source_blocks = [
+            block for block in source_document.get('blocks') or []
+            if isinstance(block, dict)
+        ]
+        caption_assets: dict[str, list[dict[str, Any]]] = {}
+        for asset in assets:
+            for text in (asset.get('caption'), asset.get('summary')):
+                caption = _coerce_str(text).strip().casefold()
+                if caption and asset not in caption_assets.setdefault(caption, []):
+                    caption_assets[caption].append(asset)
+        for position, block in enumerate(source_blocks, start=1):
+            block_id = _source_occurrence_id(block, position)
+            direct = [asset for asset in assets if block_id in asset['source_block_ids']]
+            if not direct and block_id in ready_ids:
+                profile = profiles.get(block_id) or {}
+                profile_meta = profile.get('meta') or {}
+                lookup_texts = {
+                    _coerce_str(value).strip().casefold()
+                    for value in (
+                        block.get('content'), profile.get('summary'), profile.get('title'),
+                        profile_meta.get('caption') if isinstance(profile_meta, dict) else '',
+                    )
+                    if _coerce_str(value).strip()
+                }
+                matches = []
+                for text in lookup_texts:
+                    for asset in caption_assets.get(text) or []:
+                        if asset not in matches:
+                            matches.append(asset)
+                if len(matches) == 1:
+                    direct = matches
+            if len(direct) == 1 and block_id not in direct[0]['source_block_ids']:
+                direct[0]['source_block_ids'].append(block_id)
+        ready_ids = {
+            block_id
+            for asset in assets
+            for block_id in asset.get('source_block_ids') or []
+            if block_id
+        }
+        for asset in assets:
+            asset['source_block_id'] = next(iter(asset['source_block_ids']), '')
+            asset['reuse_allowed'] = len(asset['source_block_ids']) > 1
+    return assets, ready_ids
+
+
+def _source_assets_for_bundle(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    declared = [
+        dict(item) for item in (bundle.get('asset_manifest') or [])
+        if isinstance(item, dict)
+    ]
+    if declared:
+        return declared
+    version = _coerce_str(bundle.get('version'))
+    assets: list[dict[str, Any]] = []
+    for item in (_load_material_manifest().get('images') or []):
+        if not isinstance(item, dict) or item.get('source_type') != 'source_document':
+            continue
+        if version and _coerce_str(item.get('source_version')) != version:
+            continue
+        assets.append({
+            'asset_id': _coerce_str(item.get('asset_id')),
+            'order': len(assets) + 1,
+            'local_path': _coerce_str(item.get('path')),
+            'caption': _coerce_str(item.get('caption') or item.get('alt')),
+            'source_block_id': _coerce_str(item.get('source_block_id')),
+            'source_block_ids': list(item.get('source_block_ids') or []),
+            'required': item.get('required') is True,
+            'reuse_allowed': item.get('reuse_allowed') is True,
+        })
+    return assets
+
+
+def _register_source_material_images(
+    assets: list[dict[str, Any]],
+    *,
+    source_version: str,
+    occurrence_count: Optional[int] = None,
+    missing_occurrence_ids: Optional[list[str]] = None,
+    source_images_required: bool = True,
+    retry_attempts: Optional[dict[str, int]] = None,
+    source_tool: str = 'ppt_import_source_document',
+) -> dict[str, Any]:
+    """Publish the current source inventory, retrying only a failed UI item."""
+    manifest = _load_material_manifest()
+    existing = [item for item in manifest.get('images') or [] if isinstance(item, dict)]
+    non_source = [
+        item for item in existing if item.get('source_type') != 'source_document'
+    ]
+    known = {
+        (_coerce_str(item.get('source_version')), _coerce_str(item.get('asset_id'))): item
+        for item in existing if item.get('source_type') == 'source_document'
+    }
+    current: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for asset in assets:
+        asset_id = _coerce_str(asset.get('asset_id'))
+        key = (source_version, asset_id)
+        if not asset_id:
+            continue
+        previous = known.get(key)
+        if previous and Path(_coerce_str(previous.get('path'))).is_file():
+            entry = dict(previous)
+            entry.update({
+                'source_block_id': _coerce_str(asset.get('source_block_id')),
+                'source_block_ids': list(asset.get('source_block_ids') or []),
+                'required': source_images_required,
+                'reuse_allowed': asset.get('reuse_allowed') is True,
+            })
+            current.append(entry)
+            continue
+        try:
+            entry = _stage_one_material_image({
+                'local_path': asset.get('local_path'),
+                'caption': asset.get('caption') or asset.get('summary') or asset_id,
+                'alt': asset.get('caption') or asset_id,
+                'source': 'source-document',
+            }, len(current))
+            entry.update({
+                'asset_id': asset_id,
+                'source_type': 'source_document',
+                'source_version': source_version,
+                'source_block_id': _coerce_str(asset.get('source_block_id')),
+                'source_block_ids': list(asset.get('source_block_ids') or []),
+                'required': source_images_required,
+                'reuse_allowed': asset.get('reuse_allowed') is True,
+            })
+            current.append(entry)
+        except Exception as exc:
+            errors.append(f'{asset_id or "unknown"}: {exc}')
+    if errors:
+        raise ToolExecutionError(
+            'source document image import failed: ' + '; '.join(errors[:3])
+        )
+
+    publication_attempts: dict[str, int] = {}
+    publication_errors: list[str] = []
+    for position, item in enumerate(current, start=1):
+        asset_id = _coerce_str(item.get('asset_id'))
+        last_result: Any = None
+        for attempt in range(1, _SOURCE_IMAGE_RETRY_LIMIT + 2):
+            publication_attempts[asset_id] = attempt
+            try:
+                last_result = _save_artifact(
+                    key='material_images',
+                    content_type='image',
+                    value=item['path'],
+                    source_tool=source_tool,
+                    caption=_coerce_str(item.get('caption') or item.get('alt')),
+                    sort_order=position,
+                )
+            except Exception as exc:
+                last_result = {'success': False, 'error': str(exc)}
+            status = _coerce_str(
+                last_result.get('status') if isinstance(last_result, dict) else ''
+            ).lower()
+            if not _tool_failed(last_result) and status not in {'error', 'failed'}:
+                break
+        else:
+            publication_errors.append(f'{asset_id}: {last_result!r}')
+    if publication_errors:
+        raise ToolExecutionError(
+            'source images could not be published after item-level retries: '
+            + '; '.join(publication_errors[:3])
+        )
+
+    missing = list(missing_occurrence_ids or [])
+    expected = occurrence_count if occurrence_count is not None else sum(
+        len(item.get('source_block_ids') or []) for item in current
+    )
+    ready = max(0, int(expected) - len(missing))
+    manifest['images'] = [*current, *non_source]
+    manifest['source_import'] = {
+        'source_version': source_version,
+        'source_images_required': bool(source_images_required),
+        'occurrence_count': int(expected),
+        'ready_occurrence_count': ready,
+        'unique_asset_count': len(current),
+        'published_unique_count': len(current),
+        'missing_occurrence_ids': missing,
+        'download_attempts': dict(retry_attempts or {}),
+        'publication_attempts': publication_attempts,
+        'complete': not missing,
+    }
+    manifest['updated_at'] = datetime.now(timezone(timedelta(hours=8))).isoformat(
+        timespec='seconds',
+    )
+    _write_material_manifest(manifest)
+    return {
+        'registered': len(current),
+        'published': len(current),
+        'total': len(manifest['images']),
+        'publication_attempts': publication_attempts,
+    }
+
+
+def ppt_prepare_source_document(user_input: str = '') -> dict:
+    """Fetch one cloud document once, freeze its body, and return a cheap scan.
+
+    Image provider tickets are retained privately for the material-collection
+    step, but no image bytes are downloaded or analyzed here.
+    """
+    try:
+        ctx = require_context()
+        params = ctx.params or {}
+        launch = _coerce_str(params.get('launch_user_input'))
+        current = _coerce_str(params.get('current_user_input') or params.get('user_input'))
+        authoritative = '\n'.join(value for value in (launch, current) if value)
+        locator_input = '\n'.join(value for value in (current, launch) if value)
+    except Exception:
+        authoritative = ''
+        locator_input = ''
+    request = authoritative or _coerce_str(user_input)
+    try:
+        from lazymind.document_tools import WriterResourceToolkit
+        from lazymind.document_tools.resources import find_provider_locator
+    except Exception as exc:
+        return _tool_error(
+            'ppt_prepare_source_document', f'document loader is unavailable: {exc}',
+        )
+    locator = find_provider_locator(locator_input or request)
+    if not locator:
+        return _tool_error(
+            'ppt_prepare_source_document',
+            'no supported cloud-document URL was found in the authoritative request',
+        )
+    try:
+        payload = json.loads(
+            WriterResourceToolkit().load_document(user_input=locator, stage='final')
+        )
+    except Exception as exc:
+        return _tool_error(
+            'ppt_prepare_source_document',
+            f'source document could not be read: {exc}',
+            meta={'source_url': locator},
+        )
+    source_document = payload.get('source_document') or {}
+    target_document = payload.get('target_document') or {}
+    if not isinstance(source_document, dict) or not source_document.get('document_id'):
+        return _tool_error(
+            'ppt_prepare_source_document', 'document provider returned no source document',
+        )
+    ordered_blocks = _flatten_writer_blocks(source_document.get('blocks'))
+    full_text = '\n'.join(
+        str(block.get('text') or '').strip()
+        for block in ordered_blocks if str(block.get('text') or '').strip()
+    )
+    text_hash = hashlib.sha256(full_text.encode('utf-8')).hexdigest()
+    version = _coerce_str(
+        source_document.get('revision')
+        or (source_document.get('provider_binding') or {}).get('revision')
+        or f'sha256:{text_hash}'
+    )
+    title = _coerce_str(source_document.get('title') or target_document.get('title'))
+    image_snapshot = _source_image_snapshot(source_document)
+    identity = hashlib.sha256(f'{locator}\0{version}'.encode('utf-8')).hexdigest()
+    root = _source_bundle_root(identity)
+    presentation_contract = _presentation_contract(
+        ordered_blocks, text_hash, title=title,
+    )
+    image_occurrence_count = len(image_snapshot.get('blocks') or [])
+    bundle = {
+        'schema_version': 3,
+        'provider': _coerce_str(
+            (source_document.get('provider_binding') or {}).get('provider')
+            or target_document.get('adapter')
+        ),
+        'document_id': _coerce_str(
+            (source_document.get('provider_binding') or {}).get('document_id')
+            or target_document.get('doc_id')
+            or source_document.get('document_id')
+        ),
+        'title': title,
+        'source_url': locator,
+        'version': version,
+        'text_sha256': text_hash,
+        'ordered_blocks': ordered_blocks,
+        'presentation_contract': presentation_contract,
+        # Keep the legacy key for rolling compatibility, but make its meaning
+        # explicit: this counts document occurrences, not unique binaries.
+        'source_image_count': image_occurrence_count,
+        'source_image_occurrence_count': image_occurrence_count,
+        'source_images_required': _source_images_explicitly_required(
+            request, presentation_contract,
+        ),
+        'asset_manifest': [],
+        'warnings': list(payload.get('resource_warnings') or []),
+        # Private implementation detail: image-only provider tickets, never
+        # returned to the model or copied into a deck workspace.
+        '_media_snapshot': {
+            'source_document': image_snapshot,
+            'input_resources': payload.get('input_resources') or [],
+        },
+    }
+    bundle_path = root / 'source_bundle.json'
+    bundle_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding='utf-8')
+    try:
+        saved = _save_artifact(
+            key='source_bundle',
+            content_type='json',
+            value=bundle,
+            source_tool='ppt_prepare_source_document',
+        )
+    except Exception as exc:
+        return _tool_error(
+            'ppt_prepare_source_document', f'source bundle could not be published: {exc}',
+            meta={'source_url': locator, 'source_version': version},
+        )
+    if _tool_failed(saved):
+        return _tool_error(
+            'ppt_prepare_source_document',
+            f'source bundle could not be published: {_tool_fail_reason(saved)}',
+        )
+    contract = bundle['presentation_contract']
+    return _tool_success('ppt_prepare_source_document', {
+        'source_url': locator,
+        'source_version': version,
+        'title': title,
+        'block_count': len(ordered_blocks),
+        'source_image_count': bundle['source_image_count'],
+        'image_bytes_downloaded': 0,
+        'requirement_scan': {
+            'coverage': contract['scan_coverage'],
+            'requirements': contract['requirements'],
+            'concept': contract['concept'],
+        },
+        'bundle_path': str(bundle_path.resolve()),
+    })
+
+
+def ppt_read_source_document(
+    start_index: Union[int, str, None] = 0,
+    max_chars: Union[int, str, None] = 12_000,
+) -> dict:
+    """Page through the frozen source body without contacting its provider."""
+    bundle = _json_input_value(_workflow_input_value('source_bundle'))
+    if not bundle:
+        return _tool_error('ppt_read_source_document', 'no frozen source document is bound')
+    blocks = bundle.get('ordered_blocks') or []
+    if not isinstance(blocks, list):
+        return _tool_error('ppt_read_source_document', 'frozen source blocks are invalid')
+    start = _coerce_int(start_index, 0, lo=0)
+    limit = _coerce_int(
+        max_chars, 12_000, lo=1_000, hi=_SOURCE_READ_PAGE_MAX_CHARS,
+    )
+    if start > len(blocks):
+        return _tool_error(
+            'ppt_read_source_document',
+            f'start_index {start} exceeds block count {len(blocks)}',
+        )
+    page: list[dict[str, Any]] = []
+    used = 0
+    cursor = start
+    while cursor < len(blocks):
+        raw = blocks[cursor]
+        cursor += 1
+        if not isinstance(raw, dict):
+            continue
+        view = _source_block_view(raw)
+        if not view['text']:
+            continue
+        cost = len(view['text']) + 32
+        if page and used + cost > limit:
+            cursor -= 1
+            break
+        page.append({'index': cursor - 1, **view})
+        used += cost
+    eof = cursor >= len(blocks)
+    receipt = None
+    if eof:
+        receipt = {
+            'source_url': bundle.get('source_url'),
+            'version': bundle.get('version'),
+            'text_sha256': bundle.get('text_sha256'),
+            'block_count': len(blocks),
+            'complete': True,
+        }
+        try:
+            saved = _save_artifact(
+                key='source_read_complete',
+                content_type='json',
+                value=receipt,
+                source_tool='ppt_read_source_document',
+            )
+        except Exception as exc:
+            return _tool_error(
+                'ppt_read_source_document', f'deep-read receipt could not be published: {exc}',
+            )
+        if _tool_failed(saved):
+            return _tool_error(
+                'ppt_read_source_document',
+                f'deep-read receipt could not be published: {_tool_fail_reason(saved)}',
+            )
+    return _tool_success('ppt_read_source_document', {
+        'source_url': bundle.get('source_url'),
+        'source_version': bundle.get('version'),
+        'start_index': start,
+        'next_index': cursor,
+        'eof': eof,
+        'blocks': page,
+        'presentation_contract': bundle.get('presentation_contract') or {},
+        'read_receipt': receipt,
+    })
+
+
+def ppt_materialize_source_images() -> dict:
+    """Materialize frozen images, retrying only failed document occurrences."""
+    bundle = _json_input_value(_workflow_input_value('source_bundle'))
+    if not bundle:
+        return _tool_success('ppt_materialize_source_images', {
+            'source_bound': False, 'source_image_count': 0, 'registered': 0,
+        })
+    expected = _coerce_int(
+        bundle.get('source_image_occurrence_count', bundle.get('source_image_count')),
+        0,
+        lo=0,
+    )
+    if expected == 0:
+        return _tool_success('ppt_materialize_source_images', {
+            'source_bound': True,
+            'source_version': bundle.get('version'),
+            'source_image_count': 0,
+            'registered': 0,
+        })
+    snapshot = bundle.get('_media_snapshot') or {}
+    source_document = snapshot.get('source_document') if isinstance(snapshot, dict) else None
+    if not isinstance(source_document, dict):
+        return _tool_error(
+            'ppt_materialize_source_images', 'frozen source image tickets are unavailable',
+        )
+    try:
+        from lazymind.document_tools.writing import collect_document_media
+    except Exception as exc:
+        return _tool_error(
+            'ppt_materialize_source_images', f'document media loader is unavailable: {exc}',
+        )
+    version = _coerce_str(bundle.get('version'))
+    identity = hashlib.sha256(
+        f'{bundle.get("source_url")}\0{version}'.encode('utf-8')
+    ).hexdigest()
+    media_root = _source_bundle_root(identity) / 'media'
+    media_root.mkdir(parents=True, exist_ok=True)
+    try:
+        ctx = require_context()
+        task_id = _coerce_str((ctx.params or {}).get('session_id'))
+    except Exception:
+        task_id = ''
+    task = {
+        'task_id': task_id or identity,
+        'query': 'Materialize frozen source-document images for the PPT.',
+        'task_type': 'write',
+        'constraints': {'visual_policy': {
+            'require_input_image_reuse': True,
+            'allow_image_generation': False,
+        }},
+    }
+    source_blocks = [
+        block for block in source_document.get('blocks') or []
+        if isinstance(block, dict)
+    ]
+    if len(source_blocks) != expected:
+        return _tool_error(
+            'ppt_materialize_source_images',
+            f'frozen source declares {expected} image occurrences but contains '
+            f'{len(source_blocks)} frozen image tickets',
+            meta={'source_url': bundle.get('source_url'), 'source_version': version},
+        )
+    blocks_by_id = {
+        _source_occurrence_id(block, position): block
+        for position, block in enumerate(source_blocks, start=1)
+    }
+    attempts = {block_id: 1 for block_id in blocks_by_id}
+    media_runs: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    def collect_one(
+        blocks: list[dict[str, Any]],
+        destination: Path,
+        *,
+        include_input_resources: bool,
+    ) -> None:
+        retry_document = dict(source_document)
+        retry_document['blocks'] = blocks
+        try:
+            result = collect_document_media(
+                task,
+                file_paths=[],
+                input_resources=(snapshot.get('input_resources') or [])
+                if include_input_resources else [],
+                source_document=retry_document,
+                media_store=str(destination),
+                analyze_source_images=False,
+            )
+        except Exception as exc:
+            warnings.append(str(exc))
+            return
+        if isinstance(result, dict):
+            media_runs.append(result)
+            warnings.extend(str(item) for item in (result.get('warnings') or []))
+
+    collect_one(source_blocks, media_root, include_input_resources=True)
+    assets, ready_ids = _source_assets_from_media(media_runs, source_document)
+    missing = [block_id for block_id in blocks_by_id if block_id not in ready_ids]
+    for retry_no in range(1, _SOURCE_IMAGE_RETRY_LIMIT + 1):
+        if not missing:
+            break
+        # One provider call per failed occurrence: already successful images are
+        # never redownloaded merely because a sibling image failed.
+        for block_id in list(missing):
+            attempts[block_id] += 1
+            retry_key = hashlib.sha256(block_id.encode()).hexdigest()[:8]
+            retry_root = media_root / f'retry_{retry_no}_{retry_key}'
+            retry_root.mkdir(parents=True, exist_ok=True)
+            collect_one(
+                [blocks_by_id[block_id]], retry_root,
+                include_input_resources=False,
+            )
+        assets, ready_ids = _source_assets_from_media(media_runs, source_document)
+        missing = [block_id for block_id in blocks_by_id if block_id not in ready_ids]
+
+    required = bundle.get('source_images_required') is True
+    if required and missing:
+        return _tool_error(
+            'ppt_materialize_source_images',
+            f'{len(missing)} required source image occurrence(s) could not be '
+            f'materialized after {_SOURCE_IMAGE_RETRY_LIMIT + 1} attempts',
+            detail='missing=' + ', '.join(missing[:8])
+            + (('; warnings=' + '; '.join(warnings[-3:])) if warnings else ''),
+            meta={
+                'source_url': bundle.get('source_url'),
+                'source_version': version,
+                'attempts': {block_id: attempts[block_id] for block_id in missing},
+            },
+        )
+    try:
+        registered = _register_source_material_images(
+            assets,
+            source_version=version,
+            occurrence_count=expected,
+            missing_occurrence_ids=missing,
+            source_images_required=required,
+            retry_attempts=attempts,
+            source_tool='ppt_materialize_source_images',
+        )
+    except Exception as exc:
+        return _tool_error(
+            'ppt_materialize_source_images', f'source images could not be published: {exc}',
+        )
+    return _tool_success('ppt_materialize_source_images', {
+        'source_bound': True,
+        'source_version': version,
+        'source_image_count': expected,
+        'source_image_occurrence_count': expected,
+        'source_image_unique_asset_count': len(assets),
+        'missing_occurrence_ids': missing,
+        'source_images_required': required,
+        'registered': registered['registered'],
+        'download_attempts': attempts,
+        'provider_document_refetched': False,
+        'image_analysis_performed': False,
+        'warnings': warnings[-5:],
+    })
+
+
+def ppt_import_source_document(user_input: str = '') -> dict:
+    """Import one provider document as a revision-bound PPT source bundle.
+
+    The cloud document is read once through the provider-neutral Writer loader.
+    Ordered blocks and every materialized source image are persisted together;
+    source images bypass the optional KB/web image cap and are marked required.
+    """
+    try:
+        ctx = require_context()
+        params = ctx.params or {}
+        launch = _coerce_str(params.get('launch_user_input'))
+        current = _coerce_str(params.get('current_user_input') or params.get('user_input'))
+        authoritative = '\n'.join(value for value in (launch, current) if value)
+        locator_input = '\n'.join(value for value in (current, launch) if value)
+    except Exception:
+        ctx = None
+        authoritative = ''
+        locator_input = ''
+    request = authoritative or _coerce_str(user_input)
+    try:
+        from lazymind.document_tools import WriterResourceToolkit
+        from lazymind.document_tools.resources import find_provider_locator
+        from lazymind.document_tools.writing import collect_document_media
+    except Exception as exc:
+        return _tool_error(
+            'ppt_import_source_document', f'document loader is unavailable: {exc}',
+        )
+    locator = find_provider_locator(locator_input or request)
+    if not locator:
+        return _tool_error(
+            'ppt_import_source_document',
+            'no supported cloud-document URL was found in the authoritative request',
+        )
+    try:
+        payload = json.loads(
+            WriterResourceToolkit().load_document(user_input=locator, stage='final')
+        )
+    except Exception as exc:
+        return _tool_error(
+            'ppt_import_source_document',
+            f'source document could not be read: {exc}',
+            meta={'source_url': locator},
+        )
+    source_document = payload.get('source_document') or {}
+    target_document = payload.get('target_document') or {}
+    if not isinstance(source_document, dict) or not source_document.get('document_id'):
+        return _tool_error(
+            'ppt_import_source_document', 'document provider returned no source document',
+        )
+    ordered_blocks = _flatten_writer_blocks(source_document.get('blocks'))
+    full_text = '\n'.join(
+        str(block.get('text') or '').strip()
+        for block in ordered_blocks if str(block.get('text') or '').strip()
+    )
+    text_hash = hashlib.sha256(full_text.encode('utf-8')).hexdigest()
+    version = _coerce_str(
+        source_document.get('revision')
+        or (source_document.get('provider_binding') or {}).get('revision')
+        or f'sha256:{text_hash}'
+    )
+    identity = hashlib.sha256(f'{locator}\0{version}'.encode('utf-8')).hexdigest()
+    root = _source_bundle_root(identity)
+    media_root = root / 'media'
+    media_root.mkdir(parents=True, exist_ok=True)
+    input_resources = payload.get('input_resources') or []
+    task_id = _coerce_str((ctx.params or {}).get('session_id')) if ctx else ''
+    try:
+        media = collect_document_media(
+            {
+                'task_id': task_id or identity,
+                'query': request,
+                'task_type': 'write',
+                'constraints': {'visual_policy': {
+                    'require_input_image_reuse': True,
+                    'allow_image_generation': False,
+                }},
+            },
+            file_paths=[],
+            input_resources=input_resources,
+            source_document=source_document,
+            media_store=str(media_root),
+            analyze_source_images=False,
+        )
+    except Exception as exc:
+        return _tool_error(
+            'ppt_import_source_document', f'source media could not be collected: {exc}',
+            meta={'source_url': locator, 'source_version': version},
+        )
+    raw_assets = ((media.get('media_assets') or {}).get('assets') or {})
+    assets: list[dict[str, Any]] = []
+    for position, (asset_id, raw) in enumerate(raw_assets.items(), start=1):
+        if not isinstance(raw, dict):
+            continue
+        local_path = _coerce_str(raw.get('local_path'))
+        if not local_path or not Path(local_path).is_file():
+            continue
+        meta = raw.get('meta') or {}
+        content_ref = meta.get('content_ref') or {}
+        assets.append({
+            'asset_id': _coerce_str(asset_id),
+            'order': position,
+            'local_path': str(Path(local_path).resolve()),
+            'caption': _coerce_str(raw.get('caption') or raw.get('summary')),
+            'source_block_id': _coerce_str(
+                content_ref.get('node_id') if isinstance(content_ref, dict) else ''
+            ),
+            'required': True,
+            'reuse_allowed': True,
+        })
+    expected_images = {
+        _coerce_str(item.get('uri') or item.get('file_id') or item.get('resource_id'))
+        for item in input_resources
+        if isinstance(item, dict) and item.get('resource_type') == 'image'
+    }
+    expected_images.discard('')
+    if expected_images and len(assets) < len(expected_images):
+        return _tool_error(
+            'ppt_import_source_document',
+            f'source document contains {len(expected_images)} images but only '
+            f'{len(assets)} could be materialized',
+            detail='; '.join(str(x) for x in (media.get('warnings') or [])[:3]),
+            meta={'source_url': locator, 'source_version': version},
+        )
+    bundle = {
+        'schema_version': 1,
+        'provider': _coerce_str(
+            (source_document.get('provider_binding') or {}).get('provider')
+            or target_document.get('adapter')
+        ),
+        'document_id': _coerce_str(
+            (source_document.get('provider_binding') or {}).get('document_id')
+            or target_document.get('doc_id')
+            or source_document.get('document_id')
+        ),
+        'title': _coerce_str(source_document.get('title') or target_document.get('title')),
+        'source_url': locator,
+        'version': version,
+        'text_sha256': text_hash,
+        'ordered_blocks': ordered_blocks,
+        'presentation_contract': _presentation_contract(
+            ordered_blocks,
+            text_hash,
+            title=_coerce_str(source_document.get('title') or target_document.get('title')),
+        ),
+        'asset_manifest': assets,
+        'warnings': list(payload.get('resource_warnings') or []) + list(media.get('warnings') or []),
+    }
+    bundle_path = root / 'source_bundle.json'
+    bundle_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding='utf-8')
+    try:
+        registered = _register_source_material_images(assets, source_version=version)
+        saved = _save_artifact(
+            key='source_bundle',
+            content_type='json',
+            value=bundle,
+            source_tool='ppt_import_source_document',
+        )
+    except Exception as exc:
+        return _tool_error(
+            'ppt_import_source_document', f'source bundle could not be published: {exc}',
+            meta={'source_url': locator, 'source_version': version},
+        )
+    if _tool_failed(saved):
+        return _tool_error(
+            'ppt_import_source_document',
+            f'source bundle could not be published: {_tool_fail_reason(saved)}',
+        )
+    return _tool_success('ppt_import_source_document', {
+        'source_url': locator,
+        'source_version': version,
+        'title': bundle['title'],
+        'block_count': len(ordered_blocks),
+        'source_image_count': len(assets),
+        'source_images_registered': registered['registered'],
+        'bundle_path': str(bundle_path.resolve()),
+    })
+
+
+def ppt_get_planning_context() -> dict:
+    """Resolve the selected Workflow inputs into one bounded planning context."""
+    requirement = _coerce_str(_workflow_input_value('requirement_analysis'))
+    material = _coerce_str(_workflow_input_value('material_summary'))
+    source_requirements = _json_input_value(
+        _workflow_input_value('source_requirements')
+    )
+    bundle = _json_input_value(_workflow_input_value('source_bundle'))
+    source_context: dict[str, Any] | None = None
+    if bundle:
+        blocks = bundle.get('ordered_blocks') or []
+        source_assets = _source_assets_for_bundle(bundle)
+        excerpt_parts: list[str] = []
+        used = 0
+        for block in blocks if isinstance(blocks, list) else []:
+            if not isinstance(block, dict):
+                continue
+            text = _coerce_str(block.get('text'))
+            if not text:
+                continue
+            remaining = _SOURCE_CONTEXT_MAX_CHARS - used
+            if remaining <= 0:
+                break
+            anchor = _coerce_str(block.get('source_block_id') or block.get('block_id'))
+            chunk = f'[{anchor}] {text}'[:remaining]
+            excerpt_parts.append(chunk)
+            used += len(chunk)
+        source_context = {
+            'title': bundle.get('title'),
+            'source_url': bundle.get('source_url'),
+            'version': bundle.get('version'),
+            'presentation_contract': bundle.get('presentation_contract') or {},
+            'source_excerpt': '\n'.join(excerpt_parts),
+            'asset_manifest': [
+                {
+                    'asset_id': item.get('asset_id'),
+                    'order': item.get('order'),
+                    'caption': item.get('caption'),
+                    'source_block_id': item.get('source_block_id'),
+                    'required': item.get('required') is True,
+                    'reuse_allowed': item.get('reuse_allowed') is True,
+                }
+                for item in source_assets
+                if isinstance(item, dict)
+            ],
+        }
+    return _tool_success('ppt_get_planning_context', {
+        'requirement_analysis': requirement,
+        'material_summary': material,
+        'source_requirements': source_requirements,
+        'source_document': source_context,
+        'instruction': (
+            'Treat source_document.presentation_contract and anchored source_excerpt '
+            'as authoritative. Preserve every required source asset in later image bindings.'
+            if source_context else
+            'No source document is bound; use requirement_analysis and material_summary.'
+        ),
+    })
 
 
 def _is_image_url(value: str) -> bool:
@@ -4328,16 +6085,48 @@ def _attach_material_images_to_deck(deck: Path) -> dict:
     ua = ip.setdefault('user_assets', {})
     ref_paths: list[str] = list(ua.get('reference_images') or [])
     captions: dict[str, str] = dict(ua.get('reference_image_captions') or {})
+    metadata: dict[str, dict[str, Any]] = dict(ua.get('reference_image_metadata') or {})
     images_dir = deck / 'images'
     images_dir.mkdir(parents=True, exist_ok=True)
 
+    source_version = _coerce_str((ip.get('source_bundle') or {}).get('version'))
+    if source_version:
+        stale = {
+            path for path, meta in metadata.items()
+            if isinstance(meta, dict)
+            and meta.get('source_type') == 'source_document'
+            and _coerce_str(meta.get('source_version')) != source_version
+        }
+        if stale:
+            ref_paths = [path for path in ref_paths if path not in stale]
+            for path in stale:
+                captions.pop(path, None)
+                metadata.pop(path, None)
+
+    selected: list[tuple[int, dict[str, Any]]] = []
+    optional_count = 0
+    for manifest_index, entry in enumerate(images):
+        is_source = entry.get('source_type') == 'source_document'
+        if is_source:
+            if source_version and _coerce_str(entry.get('source_version')) != source_version:
+                continue
+            selected.append((manifest_index, entry))
+            continue
+        if optional_count < 12:
+            selected.append((manifest_index, entry))
+            optional_count += 1
+
     attached = 0
-    for i, entry in enumerate(images[:12]):
+    for manifest_index, entry in selected:
         src = Path(str(entry['path']))
         if not src.is_file():
+            if entry.get('required') is True:
+                raise ToolExecutionError(
+                    f'required source image is unavailable: {entry.get("asset_id") or src.name}'
+                )
             continue
         ext = src.suffix.lower() or '.png'
-        dst = images_dir / f'material_{i + 1:02d}{ext}'
+        dst = images_dir / f'material_{manifest_index + 1:02d}{ext}'
         dst.write_bytes(src.read_bytes())
         abs_dst = str(dst.resolve())
         if abs_dst not in ref_paths:
@@ -4345,15 +6134,101 @@ def _attach_material_images_to_deck(deck: Path) -> dict:
         cap = _coerce_str(entry.get('caption') or entry.get('alt'))
         if cap:
             captions[abs_dst] = cap
+        metadata[abs_dst] = {
+            'asset_id': _coerce_str(entry.get('asset_id')),
+            'source_type': _coerce_str(entry.get('source_type') or entry.get('source')),
+            'source_version': _coerce_str(entry.get('source_version')),
+            'source_block_id': _coerce_str(entry.get('source_block_id')),
+            'source_block_ids': list(entry.get('source_block_ids') or []),
+            'required': entry.get('required') is True,
+            'reuse_allowed': entry.get('reuse_allowed') is True,
+            'order': manifest_index + 1,
+        }
         attached += 1
 
     ua['reference_images'] = ref_paths
     ua['reference_image_captions'] = captions
+    ua['reference_image_metadata'] = metadata
     ip_path.write_text(json.dumps(ip, ensure_ascii=False, indent=2), encoding='utf-8')
     return {
         'attached': attached,
         'reference_images': ref_paths,
         'captions': captions,
+    }
+
+
+def _attach_source_bundle_to_deck(deck: Path) -> dict[str, Any]:
+    """Copy the current revision-bound source bundle into one deck workspace."""
+    bundle = _json_input_value(_workflow_input_value('source_bundle'))
+    if not bundle:
+        return {'attached': False, 'source_version': '', 'source_image_count': 0}
+    ip_path = deck / 'info_pack.json'
+    ip = json.loads(ip_path.read_text(encoding='utf-8'))
+    source_assets = _source_assets_for_bundle(bundle)
+    public_bundle = {
+        key: value for key, value in bundle.items() if not str(key).startswith('_')
+    }
+    public_bundle['asset_manifest'] = source_assets
+    bundle_path = deck / 'source_bundle.json'
+    bundle_path.write_text(
+        json.dumps(public_bundle, ensure_ascii=False, indent=2), encoding='utf-8',
+    )
+    ordered_blocks = bundle.get('ordered_blocks') or []
+    full_text = '\n'.join(
+        str(block.get('text') or '').strip()
+        for block in ordered_blocks
+        if isinstance(block, dict) and str(block.get('text') or '').strip()
+    )
+    raw_path = deck / 'source_documents.json'
+    raw_path.write_text(json.dumps({
+        'documents': [{
+            'path': bundle.get('source_url') or bundle.get('document_id') or 'source-document',
+            'title': bundle.get('title') or '',
+            'text': full_text,
+            'inherited_images': [],
+            'tables': [],
+        }],
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
+    source_meta = {
+        'provider': bundle.get('provider'),
+        'document_id': bundle.get('document_id'),
+        'title': bundle.get('title'),
+        'source_url': bundle.get('source_url'),
+        'version': bundle.get('version'),
+        'text_sha256': bundle.get('text_sha256'),
+        'path': str(bundle_path.resolve()),
+    }
+    ip['source_bundle'] = source_meta
+    ip['document_digest'] = {
+        'source': source_meta,
+        'presentation_contract': bundle.get('presentation_contract') or {},
+        'inherited_images': [
+            {
+                'asset_id': item.get('asset_id'),
+                'caption_hint': item.get('caption'),
+                'source_block_id': item.get('source_block_id'),
+                'source_block_ids': list(item.get('source_block_ids') or []),
+                'required': item.get('required') is True,
+                'reuse_allowed': item.get('reuse_allowed') is True,
+            }
+            for item in source_assets
+            if isinstance(item, dict)
+        ],
+    }
+    ip['raw_document_excerpts'] = {
+        'enabled': True,
+        'path': str(raw_path.resolve()),
+        'source_version': bundle.get('version'),
+    }
+    ua = ip.setdefault('user_assets', {})
+    source_url = _coerce_str(bundle.get('source_url'))
+    ua['reference_docs'] = [source_url] if source_url else []
+    ua['reference_docs_failed'] = []
+    ip_path.write_text(json.dumps(ip, ensure_ascii=False, indent=2), encoding='utf-8')
+    return {
+        'attached': True,
+        'source_version': _coerce_str(bundle.get('version')),
+        'source_image_count': len(source_assets),
     }
 
 
@@ -5329,7 +7204,10 @@ def ppt_attach_material_images(deck_dir: str) -> dict:
         deck = _resolve_deck_dir(deck_dir)
     except FileNotFoundError as exc:
         return _tool_error('ppt_attach_material_images', str(exc))
-    result = _attach_material_images_to_deck(deck)
+    try:
+        result = _attach_material_images_to_deck(deck)
+    except (OSError, json.JSONDecodeError, ToolExecutionError) as exc:
+        return _tool_error('ppt_attach_material_images', str(exc))
     return _tool_success('ppt_attach_material_images', {
         'deck_dir': str(deck.resolve()),
         'attached': result['attached'],
@@ -5434,7 +7312,7 @@ def ppt_replace_page_material_image(
         )
 
     old_binding = page_outline.get('use_image')
-    page_outline['use_image'] = {'reference_image_index': selected_ref}
+    page_outline['use_image'] = [{'reference_image_index': selected_ref}]
     try:
         _write_outline(deck, outline)
     except OSError as exc:
@@ -5672,13 +7550,25 @@ def ppt_init_deck(
 
     existing = _bound_workflow_deck()
     if existing is not None:
-        pack, flow = _persist_deck_style_flow(existing, style_flow)
+        try:
+            pack, flow = _persist_deck_style_flow(existing, style_flow)
+            source = _attach_source_bundle_to_deck(existing)
+            contract = _ensure_requirement_contract(
+                existing, allow_source_refresh=True,
+            )
+            attached = _attach_material_images_to_deck(existing)
+        except (OSError, json.JSONDecodeError, ToolExecutionError) as exc:
+            return _tool_error('ppt_init_deck', f'bound deck source attachment failed: {exc}')
         return _tool_success('ppt_init_deck', {
             'deck_dir': str(existing), 'deck_id': pack.get('deck_id') or existing.name,
             'page_count': (pack.get('params') or {}).get('page_count'),
             'ppt_mode': pack.get('ppt_mode') or 'fast', 'reused': True,
             'style_flow': flow,
-            'material_images_attached': 0, 'next_stage': 'preflight',
+            'material_images_attached': attached['attached'],
+            'source_bundle_attached': source['attached'],
+            'source_version': source['source_version'] or None,
+            'requirement_count': len(contract.get('requirements') or []),
+            'next_stage': 'preflight',
             'stage_order': _STAGE_ORDER_HINT,
         })
 
@@ -5719,12 +7609,15 @@ def ppt_init_deck(
             'language': _infer_language(query),
             'generate_background_images': _coerce_bool(generate_background_images),
             'style_flow': flow,
+            'style_hint': style or None,
         },
         'created_at': now,
         'skill_version': '0.1.0',
     }, ensure_ascii=False, indent=2), encoding='utf-8')
     (deck_dir / 'info_pack.json').write_text(json.dumps({
         'user_query': enriched,
+        'original_user_query': query,
+        'style_hint': style or None,
         'query_normalized': {'topic': topic_text, 'key_points': key_points},
         'user_assets': {
             'reference_images': [],
@@ -5735,7 +7628,14 @@ def ppt_init_deck(
         'document_digest': None,
     }, ensure_ascii=False, indent=2), encoding='utf-8')
 
-    attached = _attach_material_images_to_deck(deck_dir)
+    try:
+        source = _attach_source_bundle_to_deck(deck_dir)
+        contract = _ensure_requirement_contract(
+            deck_dir, allow_source_refresh=True,
+        )
+        attached = _attach_material_images_to_deck(deck_dir)
+    except (OSError, json.JSONDecodeError, ToolExecutionError) as exc:
+        return _tool_error('ppt_init_deck', f'source attachment failed: {exc}')
     _bind_workflow_deck(deck_dir)
 
     return _tool_success('ppt_init_deck', {
@@ -5745,6 +7645,9 @@ def ppt_init_deck(
         'ppt_mode': mode,
         'style_flow': flow,
         'material_images_attached': attached['attached'],
+        'source_bundle_attached': source['attached'],
+        'source_version': source['source_version'] or None,
+        'requirement_count': len(contract.get('requirements') or []),
         'next_stage': 'preflight',
         'stage_order': _STAGE_ORDER_HINT,
     })
@@ -6275,10 +8178,14 @@ def ppt_build_outline(
         try:
             deck = _resolve_deck_dir(resolved_deck)
             pack, flow = _persist_deck_style_flow(deck, style_flow or ppt_mode)
-        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            source = _attach_source_bundle_to_deck(deck)
+            contract = _ensure_requirement_contract(
+                deck, allow_source_refresh=True,
+            )
+            attached = _attach_material_images_to_deck(deck)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ToolExecutionError) as exc:
             return _tool_error('ppt_build_outline', f'prepared deck is invalid: {exc}')
         params = pack.get('params') or {}
-        attached = _attach_material_images_to_deck(deck)
         prepared_backgrounds_enabled = _coerce_bool(
             params.get('generate_background_images'),
         )
@@ -6290,6 +8197,9 @@ def ppt_build_outline(
             'ppt_mode': pack.get('ppt_mode') or 'fast',
             'style_flow': flow,
             'material_images_attached': attached['attached'],
+            'source_bundle_attached': source['attached'],
+            'source_version': source['source_version'] or None,
+            'requirement_count': len(contract.get('requirements') or []),
         }
     else:
         init_res = ppt_init_deck(
@@ -6976,13 +8886,18 @@ def ppt_publish_outline(
                 'ppt_publish_outline',
                 'insert_before requires pages to contain exactly the same one position',
             )
+        contract_summary = _publish_requirement_contract_summary(deck)
         if (deck / 'outline_draft.md').exists() and not insertion:
             result = _publish_text_page_briefs(deck, page_list)
         else:
             result = _publish_slide_outlines_from_disk(
                 deck, page_list, insert_before=insertion or None,
             )
-    except (FileNotFoundError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        result['requirement_contract_summary'] = contract_summary
+    except (
+        FileNotFoundError, ValueError, KeyError, json.JSONDecodeError,
+        ToolExecutionError,
+    ) as exc:
         return _tool_error('ppt_publish_outline', str(exc))
 
     if result.get('published_count', 0) <= 0:

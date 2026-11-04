@@ -118,7 +118,8 @@ func (s WorkflowControlService) Execute(ctx context.Context, owner, sessionID st
 			if err := controlstore.ClearEditPause(tx, session); err != nil {
 				return err
 			}
-			if err := confirmWorkflowReview(ctx, tx, session, owner, command); err != nil {
+			publishApprovalSnapshot := command.Kind != "confirm_and_continue"
+			if err := confirmWorkflowReview(ctx, tx, session, owner, command, publishApprovalSnapshot); err != nil {
 				return err
 			}
 			result.Receipt.ReviewID = command.ReviewID
@@ -246,6 +247,14 @@ func (s WorkflowControlService) Execute(ctx context.Context, owner, sessionID st
 		if err := controlstore.BumpEvent(tx, session, "control.changed", session.ID, command.CommandID, result.Receipt); err != nil {
 			return err
 		}
+		if command.Kind == "confirm_and_continue" {
+			// Approval, route projection, and host delivery are one transaction.
+			// Publish only their final state so subscribers never observe the
+			// successful reviewed step as failed between approval and hand-off.
+			if err := appendSessionProjectionSnapshot(ctx, tx, session); err != nil {
+				return err
+			}
+		}
 		receipt, err := json.Marshal(result.Receipt)
 		if err != nil {
 			return err
@@ -353,7 +362,7 @@ func ensureNoActiveAttempts(tx *gorm.DB, sessionID string) error {
 	return nil
 }
 
-func confirmWorkflowReview(ctx context.Context, tx *gorm.DB, session *orm.WorkflowSession, owner string, command WorkflowControlCommand) error {
+func confirmWorkflowReview(ctx context.Context, tx *gorm.DB, session *orm.WorkflowSession, owner string, command WorkflowControlCommand, publishSnapshot bool) error {
 	if session.Status == "stopped" {
 		return controlstore.Reject("SESSION_STOPPED", "resume before confirming")
 	}
@@ -406,7 +415,7 @@ func confirmWorkflowReview(ctx context.Context, tx *gorm.DB, session *orm.Workfl
 			return err
 		}
 	}
-	if err := freezeRouteDecision(ctx, tx, session.ID, review.StepID, review.AttemptID); err != nil {
+	if err := freezeRouteDecisionWithSnapshot(ctx, tx, session.ID, review.StepID, review.AttemptID, publishSnapshot); err != nil {
 		return err
 	}
 	return tx.Where("id = ?", session.ID).First(session).Error

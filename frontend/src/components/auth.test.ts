@@ -1,13 +1,21 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { AgentAppsAuth, AUTH_USER_CHANGE_EVENT } from './auth';
-const mocks = vi.hoisted(() => ({ post: vi.fn(), api: 'https://one/auth/refresh' }));
+const mocks = vi.hoisted(() => ({
+  post: vi.fn(), api: 'https://one/auth/refresh', clearSession: vi.fn(), logoutServer: vi.fn(),
+}));
 vi.mock('axios', () => ({ default: { create: () => ({ post: mocks.post }) } }));
 vi.mock('@/runtime/apiBase', () => ({ authServiceApiUrl: () => mocks.api, coreApiUrl: () => '/core' }));
 vi.mock('@/i18n', () => ({ default: { t: (s: string) => s } }));
-vi.mock('@/modules/signin/utils/request', () => ({ logoutFromServer: vi.fn() }));
-vi.mock('@/runtime/assistantSession', () => ({ clearLocalAssistantSession: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('@/modules/signin/utils/request', () => ({ logoutFromServer: mocks.logoutServer }));
+vi.mock('@/runtime/assistantSession', () => ({ clearLocalAssistantSession: mocks.clearSession }));
 const user = (name: string) => ({ username: name, userId: name, token: name + '-access', refreshToken: name + '-refresh', tenantId: name + '-tenant' });
-beforeEach(() => { localStorage.clear(); mocks.post.mockReset(); mocks.api = 'https://one/auth/refresh'; });
+beforeEach(() => {
+  localStorage.clear();
+  mocks.post.mockReset();
+  mocks.clearSession.mockReset().mockResolvedValue(undefined);
+  mocks.logoutServer.mockReset().mockResolvedValue(undefined);
+  mocks.api = 'https://one/auth/refresh';
+});
 it.each(['switch', 'clear-switch', 'backend'])('rejects stale refresh after %s without publishing old credentials', async mode => {
   AgentAppsAuth.setUserInfo(user('A'));
   let done!: (value: unknown) => void;
@@ -71,8 +79,20 @@ it('logout invalidates refresh before awaiting network cleanup and preserves a s
   expect(await refresh).toBeInstanceOf(Error);
   finishCleanup({});
   await logout;
+  expect(mocks.clearSession).toHaveBeenCalledOnce();
+  expect(mocks.logoutServer).toHaveBeenCalledOnce();
   expect(AgentAppsAuth.getUserInfo()).toMatchObject(user('B'));
   vi.unstubAllGlobals();
+});
+
+it('browser-session invalidation does not revoke or clear persistent credentials', () => {
+  AgentAppsAuth.setUserInfo(user('A'));
+
+  AgentAppsAuth.invalidateBrowserSession(window.location.href);
+
+  expect(AgentAppsAuth.getUserInfo()).toBeNull();
+  expect(mocks.clearSession).not.toHaveBeenCalled();
+  expect(mocks.logoutServer).not.toHaveBeenCalled();
 });
 
 it('keeps the session and a pending rotated refresh through profile updates', async () => {

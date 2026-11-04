@@ -170,6 +170,38 @@ func TestExpiredLeaseReclaimFencesOldExecutor(t *testing.T) {
 	}
 }
 
+func TestExpiredLeaseWaitsForGraceAndLetsCurrentExecutorRecover(t *testing.T) {
+	service, _ := testService(t)
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	queue(t, service, "a1", "s1", "step")
+	first, err := service.Claim(context.Background(), "executor")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The nominal lease has expired, but the current executor is still inside
+	// the recovery grace period. A replacement must not fence it yet.
+	now = now.Add(time.Minute + 10*time.Second)
+	if _, err := service.Claim(context.Background(), "replacement"); !errors.Is(err, ErrNotClaimable) {
+		t.Fatalf("replacement claimed during grace: %v", err)
+	}
+	expires, err := service.Heartbeat(context.Background(), "a1", first.LeaseToken)
+	if err != nil {
+		t.Fatalf("current executor could not recover during grace: %v", err)
+	}
+	if !expires.Equal(now.Add(time.Minute)) {
+		t.Fatalf("recovered lease expires=%v", expires)
+	}
+	row, err := service.Attempt(context.Background(), "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.FencingGeneration != first.FencingGeneration || row.LeaseToken != first.LeaseToken {
+		t.Fatalf("grace recovery rotated the execution: %#v", row)
+	}
+}
+
 func TestHeartbeatExtendsLeaseAndTransitionsRunning(t *testing.T) {
 	service, _ := testService(t)
 	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
@@ -202,7 +234,11 @@ func TestValidateLeaseAcceptsOnlyCurrentLiveOwner(t *testing.T) {
 	if err := service.ValidateLease(context.Background(), "a1", "stale"); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("stale lease error=%v", err)
 	}
-	now = now.Add(2 * time.Minute)
+	now = now.Add(time.Minute + 10*time.Second)
+	if err := service.ValidateLease(context.Background(), "a1", claim.LeaseToken); err != nil {
+		t.Fatalf("lease inside recovery grace was rejected: %v", err)
+	}
+	now = now.Add(50 * time.Second)
 	if err := service.ValidateLease(context.Background(), "a1", claim.LeaseToken); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("expired lease error=%v", err)
 	}

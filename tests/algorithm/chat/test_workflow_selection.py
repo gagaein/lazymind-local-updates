@@ -7,6 +7,7 @@ import pytest
 from lazyllm.tools.agent.toolsManager import ModuleTool
 
 from lazymind.chat.workflow.workflow_manager import (
+    _with_terminal_agent_control,
     enforce_startup_clarification_policy,
     resolve_workflow_injection,
     workflow_startup_clarification_already_asked,
@@ -58,6 +59,19 @@ def _tool_names(contribution):
         else:
             names.add(tool.__name__)
     return names
+
+
+def test_user_stopped_workflow_ends_turn_without_another_model_call():
+    result = _with_terminal_agent_control({
+        'status': 'interrupted',
+        'outcome': 'user_stopped',
+    })
+
+    assert result['_agent_control'] == {
+        'stop': True,
+        'reason': 'user_stopped',
+        'final_text': '工作流已暂停，已生成内容已保留。',
+    }
 
 
 @pytest.mark.parametrize('workflow_id', [

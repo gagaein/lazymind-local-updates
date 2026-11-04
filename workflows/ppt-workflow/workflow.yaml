@@ -28,6 +28,7 @@ runtime:
     - style_selection
     - deck_outline
     - slide_outline
+    - requirement_contract_summary
     - background_prompts
     - background_images
     - preview_html
@@ -142,10 +143,17 @@ tool_scripts:
       - ppt_search_web_images
       - ppt_register_material_images
       - ppt_generate_material_images
+      - ppt_import_source_document
+      - ppt_prepare_source_document
+      - ppt_read_source_document
+      - ppt_materialize_source_images
+      - ppt_get_planning_context
       - ppt_publish_background_prompts
       - ppt_prepare_style_choices
       - ppt_prepare_style
       - ppt_generate_background_images
+      - ppt_publish_requirement_analysis
+      - ppt_publish_material_summary
       - check_ppt_workflow_capabilities
       - ppt_attach_material_images
       - ppt_replace_page_material_image
@@ -258,6 +266,27 @@ slots:
     cardinality: single
     summary_max_chars: 700
 
+  - id: source_requirements
+    label: Source Requirements
+    type: json
+    cardinality: single
+    exposed: false
+    summary_max_chars: 400
+
+  - id: source_bundle
+    label: Source Document Bundle
+    type: json
+    cardinality: single
+    exposed: false
+    summary_max_chars: 400
+
+  - id: source_read_complete
+    label: Source Deep Read Receipt
+    type: json
+    cardinality: single
+    exposed: false
+    summary_max_chars: 200
+
   - id: material_images
     label: Material Images
     type: image
@@ -295,6 +324,12 @@ slots:
     cardinality: list
     ordered: true
     summary_max_chars: 900
+
+  - id: requirement_contract_summary
+    label: Complete Requirements
+    type: text
+    cardinality: single
+    summary_max_chars: 1600
 
   - id: deck_outline
     label: Deck Outline
@@ -338,6 +373,10 @@ ui:
     slide_outline:
       widgetType: text-markdown
       maxHeight: 420
+    requirement_contract_summary:
+      widgetType: text-markdown
+      maxHeight: 320
+      readOnly: true
     deck_outline:
       widgetType: text-markdown
       maxHeight: 420
@@ -423,10 +462,12 @@ ui:
       slot_scope: step
       composite_tab_position: left
       slots:
+        - id: requirement_contract_summary
         - id: slide_outline
       composite_layout:
-        direction: row
+        direction: column
         children:
+          - slot: requirement_contract_summary
           - slot: slide_outline
       composite_behavior:
         hide_empty_columns: true
@@ -484,6 +525,7 @@ i18n:
     slots:
       requirement_analysis: {label: 需求分析}
       material_summary: {label: 素材摘要}
+      source_requirements: {label: 源文档完整需求}
       material_images: {label: 素材图片}
       style_previews: {label: 风格预览}
       style_selection: {label: 已选风格}
@@ -491,5 +533,6 @@ i18n:
       background_images: {label: AI 底图}
       deck_outline: {label: 大纲}
       slide_outline: {label: 每页提示词}
+      requirement_contract_summary: {label: 完整需求}
       preview_html: {label: 幻灯片}
       preview_notes: {label: 讲稿}

@@ -99,10 +99,16 @@ function installNotificationSessionSync(target, bridge) {
       access_token: user.token, refresh_token: user.refreshToken,
       role: user.role, tenant_id: user.tenantId || user.tenant_id,
     } : null;
+    // Browser state can be absent while local auto-login is recovering. Only
+    // the explicit logout path may clear the persistent Assistant session.
+    if (!value) {
+      previous = undefined;
+      return;
+    }
     const fingerprint = JSON.stringify(value);
     if (previous === fingerprint) return;
     previous = fingerprint;
-    const operation = value ? bridge.assistantSessionSet(value) : bridge.assistantSessionClear();
+    const operation = bridge.assistantSessionSet(value);
     Promise.resolve(operation).catch(() => {
       // A later readiness/login event can retry; never log session material.
       if (previous === fingerprint) previous = undefined;

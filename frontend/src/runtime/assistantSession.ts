@@ -108,7 +108,6 @@ export async function syncLocalAssistantSession(
   timeoutMs: number,
 ): Promise<void> {
   if (!user?.token || !user.refreshToken) {
-    await clearLocalAssistantSession(timeoutMs);
     return;
   }
   const session: LocalAssistantSession = {

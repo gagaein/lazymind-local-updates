@@ -309,6 +309,15 @@ def _compact_transition_result(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _with_terminal_agent_control(result: Dict[str, Any]) -> Dict[str, Any]:
+    if result.get('outcome') == 'user_stopped':
+        return {
+            **result,
+            '_agent_control': {
+                'stop': True,
+                'reason': 'user_stopped',
+                'final_text': '工作流已暂停，已生成内容已保留。',
+            },
+        }
     workflow_state = result.get('workflow_state')
     workflow_state = workflow_state if isinstance(workflow_state, dict) else {}
     projection = result.get('projection')

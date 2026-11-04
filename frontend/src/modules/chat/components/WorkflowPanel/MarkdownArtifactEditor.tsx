@@ -301,6 +301,11 @@ function isEscaped(value: string, index: number): boolean {
   return backslashes % 2 === 1;
 }
 
+const MDX_VOID_ELEMENT_NAMES = new Set([
+  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+  'link', 'meta', 'param', 'source', 'track', 'wbr',
+]);
+
 function mdxMarkupLength(line: string, start: number): number {
   const linkDestination = /\]\([ \t]*$/.exec(line.slice(0, start));
   if (linkDestination && !isEscaped(line, linkDestination.index)) {
@@ -314,7 +319,16 @@ function mdxMarkupLength(line: string, start: number): number {
   const markup = line.slice(start).match(
     /^(?:<!--.*?-->|<\/?[A-Za-z][A-Za-z0-9:._-]*(?=[\s/>])[^<>]*>|<(?:https?:\/\/|mailto:)[^<>\s]+>|<[^<>\s@]+@[^<>\s@]+>)/i,
   );
-  return markup?.[0].length ?? 0;
+  if (!markup) return 0;
+
+  const openingElement = markup[0].match(/^<([A-Za-z][A-Za-z0-9:._-]*)(?:\s[^<>]*)?>$/);
+  if (
+    openingElement
+    && MDX_VOID_ELEMENT_NAMES.has(openingElement[1].toLowerCase())
+    && !markup[0].endsWith('/>')
+  ) return 0;
+
+  return markup[0].length;
 }
 
 function escapeMdxPlainTextInLine(line: string): string {

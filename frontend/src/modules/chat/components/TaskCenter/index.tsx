@@ -1148,7 +1148,7 @@ const TaskCenter = (props: Props) => {
       Date.parse(b.timing!.requested_at) - Date.parse(a.timing!.requested_at))[0];
     // A continuation/approval Chat round does not own the Workflow clock.
     // After the Workflow ends, new ordinary tasks can own the panel again.
-    const workflowFinished = ['completed', 'failed'].includes(workflowSession?.projection?.display?.status ?? '');
+    const workflowFinished = ['completed', 'failed', 'interrupted'].includes(workflowSession?.projection?.display?.status ?? '');
     const hasNewChatTasks = latest && workflowFinished && tasks.some(task => task.agent_type !== 'workflow_step'
       && (task.ordinary?.run_id === latest.run_id || task.trigger_history_id === latest.run_id));
     return workflowSession && !hasNewChatTasks ? byRun.get(workflowSession.session_id) : latest;

@@ -38,7 +38,8 @@ type protocolError string
 func (e protocolError) Error() string { return string(e) }
 
 type Config struct {
-	LeaseDuration time.Duration
+	LeaseDuration    time.Duration
+	LeaseGracePeriod time.Duration
 }
 
 func (c Config) leaseDuration() time.Duration {
@@ -46,6 +47,13 @@ func (c Config) leaseDuration() time.Duration {
 		return 30 * time.Second
 	}
 	return c.LeaseDuration
+}
+
+func (c Config) leaseGracePeriod() time.Duration {
+	if c.LeaseGracePeriod <= 0 {
+		return 30 * time.Second
+	}
+	return c.LeaseGracePeriod
 }
 
 type Service struct {
@@ -158,8 +166,10 @@ func newToken() (string, error) {
 	return hex.EncodeToString(value), nil
 }
 
-// Claim uses a compare-and-swap update. Expired claimed/running Attempts may
-// be reclaimed and always receive a new token and higher fencing generation.
+// Claim uses a compare-and-swap update. Claimed/running Attempts are reclaimed
+// only after a short recovery grace period, then receive a new token and higher
+// fencing generation. The grace lets the current executor survive a transient
+// heartbeat outage without starting a duplicate execution.
 func (s *Service) Claim(ctx context.Context, executorID string) (Claim, error) {
 	return s.ClaimForHost(ctx, executorID, "")
 }
@@ -174,10 +184,11 @@ func (s *Service) ClaimForHost(ctx context.Context, executorID, host string) (Cl
 		return Claim{}, ErrSchemaUnavailable
 	}
 	now := s.now()
+	reclaimBefore := now.Add(-s.config.leaseGracePeriod())
 	var candidate orm.WorkflowSessionStep
 	query := s.db.WithContext(ctx).Model(&orm.WorkflowSessionStep{}).Where(
 		"plugin_session_steps.validity = 'effective' AND (plugin_session_steps.status = 'queued' OR "+ // workflow-naming: persistence
-			"(plugin_session_steps.status IN ('claimed','running') AND plugin_session_steps.lease_expires_at < ?))", now, // workflow-naming: persistence
+			"(plugin_session_steps.status IN ('claimed','running') AND plugin_session_steps.lease_expires_at < ?))", reclaimBefore, // workflow-naming: persistence
 	)
 	if host != "" {
 		query = query.Joins("JOIN plugin_sessions ps ON ps.id = plugin_session_steps.session_id").
@@ -235,6 +246,7 @@ func (s *Service) ClaimQueuedAttemptForHost(ctx context.Context, attemptID, exec
 
 func (s *Service) claimCandidate(ctx context.Context, candidate orm.WorkflowSessionStep, executorID string, allowCurrentOwner bool) (Claim, error) {
 	now := s.now()
+	reclaimBefore := now.Add(-s.config.leaseGracePeriod())
 	token, err := newToken()
 	if err != nil {
 		return Claim{}, err
@@ -256,7 +268,7 @@ func (s *Service) claimCandidate(ctx context.Context, candidate orm.WorkflowSess
 		if controlled {
 			condition = "id = ? AND fencing_generation = ? AND (status = 'queued' OR (status IN ('claimed','running') AND lease_expires_at < ?)"
 		}
-		args := []any{candidate.ID, candidate.FencingGeneration, now}
+		args := []any{candidate.ID, candidate.FencingGeneration, reclaimBefore}
 		if allowCurrentOwner {
 			condition += " OR (lease_owner = ? AND status IN ('claimed','running'))"
 			args = append(args, executorID)
@@ -289,9 +301,10 @@ func (s *Service) claimCandidate(ctx context.Context, candidate orm.WorkflowSess
 }
 
 func (s *Service) validLeaseQuery(attemptID, token string, now time.Time) *gorm.DB {
+	validAfter := now.Add(-s.config.leaseGracePeriod())
 	return s.db.Model(&orm.WorkflowSessionStep{}).Where(
 		"id = ? AND lease_token = ? AND lease_expires_at >= ? AND status IN ('claimed','running')",
-		attemptID, token, now,
+		attemptID, token, validAfter,
 	)
 }
 
@@ -335,10 +348,11 @@ func (s *Service) Progress(ctx context.Context, attemptID, token string, progres
 		return err
 	}
 	now := s.now()
+	validAfter := now.Add(-s.config.leaseGracePeriod())
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&orm.WorkflowSessionStep{}).Where(
 			"id = ? AND lease_token = ? AND lease_expires_at >= ? AND status IN ('claimed','running')",
-			attemptID, token, now).UpdateColumn("updated_at", gorm.Expr("updated_at"))
+			attemptID, token, validAfter).UpdateColumn("updated_at", gorm.Expr("updated_at"))
 		if result.Error != nil {
 			return result.Error
 		}
@@ -395,7 +409,8 @@ func (s *Service) Terminal(ctx context.Context, attemptID, token, status, code s
 			}
 			return ErrAlreadyTerminal
 		}
-		if current.LeaseToken != token || current.LeaseExpiresAt == nil || current.LeaseExpiresAt.Before(now) {
+		if current.LeaseToken != token || current.LeaseExpiresAt == nil ||
+			current.LeaseExpiresAt.Before(now.Add(-s.config.leaseGracePeriod())) {
 			return ErrLeaseLost
 		}
 		updated := tx.Model(&orm.WorkflowSessionStep{}).

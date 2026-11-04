@@ -466,7 +466,7 @@ class WholePageInsertionTests(unittest.TestCase):
             'use_table': False,
         })
 
-        self.assertIsNone(page['use_image'])
+        self.assertEqual(page['use_image'], [])
         self.assertIsNone(page['use_table'])
 
     def test_full_generate_tool_honors_pending_single_page_insertion(self):
@@ -1477,7 +1477,7 @@ class SinglePageMediaEditTests(unittest.TestCase):
             outline = json.loads((deck / 'outline.json').read_text(encoding='utf-8'))
             self.assertIsNone(outline['pages'][0].get('use_image'))
             self.assertEqual(
-                outline['pages'][1]['use_image'], {'reference_image_index': 0},
+                outline['pages'][1]['use_image'], [{'reference_image_index': 0}],
             )
             self.assertIsNone(outline['pages'][2].get('use_image'))
             publish_outline.assert_called_once_with(deck, 2)

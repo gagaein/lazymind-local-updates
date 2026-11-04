@@ -310,9 +310,13 @@ func stopWorkflowSession(
 			if step.LeaseToken != "" || step.Status == StepStatusRunning {
 				code = "WORKFLOW_STOP_REQUESTED"
 			}
+			updates := map[string]any{"terminal_code": code}
+			if code == "WORKFLOW_STOPPED" {
+				updates["lease_expires_at"] = nil
+			}
 			if err := tx.Model(&orm.WorkflowSessionStep{}).
 				Where("task_id = ? AND status = ?", step.TaskID, StepStatusInterrupted).
-				UpdateColumns(map[string]any{"terminal_code": code, "lease_expires_at": nil}).Error; err != nil {
+				Updates(updates).Error; err != nil {
 				return err
 			}
 			// Notify Python to cancel the ReAct loop for this task.

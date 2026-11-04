@@ -1932,7 +1932,7 @@ export function WorkflowPanel({
   const availableActions = new Set(externalControl?.available_actions ?? []);
   const pendingReview = externalControl?.reviews.find(review => review.status === 'pending');
   const approvalStepId = display?.status === 'waiting' ? display.approval_step_id : undefined;
-  const displayStatusKey = workflowDisplayLabel(display?.status);
+  const displayStatusKey = workflowDisplayLabel(display?.status, display?.reason);
   // A native Chat submission can outlive this panel (it moves to the new reply).
   // Keep controls locked until that turn ends, even before workflow events arrive.
   // Dirty editors do not disable retry — click flushes saves first, then proceeds.
@@ -2399,7 +2399,7 @@ export function WorkflowPanel({
           ) : null}
           {sessionBusy && !approvalStepId && (
             <span className='workflow-panel__execution-status' role='status'>
-              {t('chat.workflowStatusRunning')}{session.current_step_id ? ` · ${stepLabel(session.current_step_id)}` : ''}
+              {t(displayStatusKey)}{session.current_step_id ? ` · ${stepLabel(session.current_step_id)}` : ''}
               {stopping ? ` · ${t('chat.workflowStoppingHint')}` : ''}
             </span>
           )}
